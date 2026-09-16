@@ -17,7 +17,7 @@ Auto-discovered via the `attackmap.analyzers` entry point once installed.
 ## Install
 
 ```bash
-pip install attackmap-analyzer-swift    # alongside attackmap>=0.4.29
+pip install git+https://github.com/mlaify/attackmap-analyzer-swift.git    # alongside attackmap
 ```
 
 Then AttackMap picks it up automatically:
