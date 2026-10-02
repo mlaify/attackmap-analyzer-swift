@@ -23,11 +23,17 @@ Auto-discovered via the `attackmap.analyzers` entry point once installed.
 pip install git+https://github.com/mlaify/attackmap-analyzer-swift.git    # alongside attackmap
 ```
 
-Then AttackMap picks it up automatically:
+The analyzer is **experimental and opt-in** (`enabled_by_default=False`): installing
+it does not make it run on every scan. Select it explicitly:
 
 ```bash
-attackmap analyze /path/to/swift/project
+attackmap analyze /path/to/swift/project -m swift
 ```
+
+Files are walked with `attackmap.sdk.iter_repo_files`: `.build/`, `DerivedData/`,
+`Pods/`, `Carthage/` and AttackMap's shared skip list (`build/`, `.git/`,
+`node_modules/`, ...) are pruned by their name *inside* the repo, and symlinks out
+of the repo are not followed.
 
 ## What it does today
 

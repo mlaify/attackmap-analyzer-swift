@@ -1,5 +1,8 @@
 import json
+import sys
 from pathlib import Path
+
+import pytest
 
 from attackmap_analyzer_swift import SwiftAnalyzer
 
@@ -125,3 +128,46 @@ def test_metadata_contract():
     assert m.name == "swift"
     assert "swift" in m.languages
     assert SwiftAnalyzer().name == "swift"
+
+
+def test_detect_xcode_project_bundle(tmp_path: Path):
+    _write(tmp_path, "App.xcodeproj/project.pbxproj", "// !$*UTF8*$!\n")
+    assert SwiftAnalyzer().detect(tmp_path) is True
+
+
+def test_experimental_analyzer_is_opt_in():
+    m = SwiftAnalyzer().metadata
+    assert m.experimental is True
+    assert m.enabled_by_default is False
+
+
+# ---------- Repo walking (AttackMap#253) ----------
+
+
+def test_repo_under_skip_dir_named_parents_is_analyzed(tmp_path: Path):
+    """A checkout under /.../build/out/... must not be skipped (absolute-path bug)."""
+    repo = tmp_path / "build" / "out" / "repo"
+    _write(repo, "Package.swift", PACKAGE_SWIFT)
+    _write(repo, "Package.resolved", RESOLVED_V2)
+    _write(repo, "Sources/App/main.swift", 'print("run")\n')
+    analyzer = SwiftAnalyzer()
+    assert analyzer.detect(repo) is True
+    result = analyzer.analyze(repo)
+    assert {d.name for d in result.dependencies} == {"vapor", "swift-nio"}
+    assert any(h.hint == "SwiftPM" and h.file == "Package.swift" for h in result.framework_hints)
+    assert any(e.file == "Sources/App/main.swift" for e in result.entrypoint_hints)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_symlinked_files_outside_repo_not_analyzed(tmp_path: Path):
+    outside = tmp_path / "outside"
+    _write(outside, "Package.resolved", RESOLVED_V2)
+    _write(outside, "Secret.swift", "@main\nstruct Secret {}\n")
+    repo = tmp_path / "repo"
+    _write(repo, "Package.swift", PACKAGE_SWIFT)
+    (repo / "Package.resolved").symlink_to(outside / "Package.resolved")
+    (repo / "Secret.swift").symlink_to(outside / "Secret.swift")
+    result = SwiftAnalyzer().analyze(repo)
+    assert result.dependencies == []
+    assert result.entrypoint_hints == []
+    assert [h.hint for h in result.framework_hints if h.hint == "SwiftPM"] == ["SwiftPM"]
