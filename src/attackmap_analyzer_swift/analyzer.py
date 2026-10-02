@@ -12,6 +12,8 @@ import json
 import re
 from pathlib import Path
 
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
+
 from .contracts import (
     AnalyzerMetadata,
     DependencyHint,
@@ -20,16 +22,18 @@ from .contracts import (
     ScanResult,
 )
 
-SKIP_DIRS = {
-    ".git",
+# Swift-specific additions to the shared skip list (which already covers
+# build/, .git/, node_modules/, __pycache__/, ...). Matched against directory
+# names *inside* the repo only.
+SKIP_DIRS = DEFAULT_SKIP_DIRS | {
     ".build",          # SwiftPM build products
-    "build",
     "DerivedData",     # Xcode build products
     "Pods",            # CocoaPods vendored sources
     "Carthage",
-    "node_modules",
-    "__pycache__",
 }
+
+_MANIFEST_NAMES = {"Package.swift", "Package.resolved"}
+_XCODE_BUNDLE_SUFFIXES = {".xcodeproj", ".xcworkspace"}
 
 # Known server-side frameworks worth surfacing when seen in Package.swift deps.
 _FRAMEWORK_HINTS: dict[str, str] = {
@@ -57,7 +61,12 @@ def _line_of(content: str, needle: str) -> int | None:
     idx = content.find(needle)
     if idx < 0:
         return None
-    return content.count("\n", 0, idx) + 1
+    return line_of(content, idx)
+
+
+def _in_xcode_bundle(path: Path, root: Path) -> bool:
+    """True if ``path`` sits inside a ``*.xcodeproj`` / ``*.xcworkspace`` bundle."""
+    return any(Path(part).suffix in _XCODE_BUNDLE_SUFFIXES for part in Path(rel(path, root)).parts[:-1])
 
 
 class SwiftAnalyzer:
@@ -71,7 +80,7 @@ class SwiftAnalyzer:
         languages=["swift"],
         priority=20,
         experimental=True,  # Early scaffold — coverage is intentionally partial.
-        enabled_by_default=True,
+        enabled_by_default=False,  # opt-in via `-m swift` while experimental (AttackMap#221)
     )
 
     @property
@@ -84,15 +93,12 @@ class SwiftAnalyzer:
         root = Path(repo_path).resolve()
         if not root.exists() or not root.is_dir():
             return False
-        for path in root.rglob("*"):
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
-            name = path.name
-            if name in {"Package.swift", "Package.resolved"}:
+        # The walker yields files only, so an Xcode project/workspace bundle is
+        # recognized by the files inside it (project.pbxproj, ...).
+        for path in iter_repo_files(root, skip_dirs=SKIP_DIRS):
+            if path.name in _MANIFEST_NAMES or path.suffix == ".swift":
                 return True
-            if path.is_dir() and path.suffix in {".xcodeproj", ".xcworkspace"}:
-                return True
-            if path.is_file() and path.suffix == ".swift":
+            if _in_xcode_bundle(path, root):
                 return True
         return False
 
@@ -102,27 +108,37 @@ class SwiftAnalyzer:
         if not root.exists() or not root.is_dir():
             return result
 
-        direct = self._analyze_manifest(root, result)
-        self._analyze_resolved(root, result, direct)
-        self._analyze_entrypoints(root, result)
+        # One walk; manifests are processed before Package.resolved because the
+        # resolved pins are marked direct against the manifests' dependencies.
+        manifests: list[Path] = []
+        resolved: list[Path] = []
+        sources: list[Path] = []
+        for path in iter_repo_files(root, suffixes={".swift"}, names=_MANIFEST_NAMES, skip_dirs=SKIP_DIRS):
+            if path.name == "Package.swift":
+                manifests.append(path)
+            elif path.name == "Package.resolved":
+                resolved.append(path)
+            if path.suffix == ".swift":
+                sources.append(path)
+
+        direct = self._analyze_manifest(root, manifests, result)
+        self._analyze_resolved(root, resolved, result, direct)
+        self._analyze_entrypoints(root, sources, result)
         return result
 
     # ---------- Package.swift (manifest) ----------
 
-    def _analyze_manifest(self, root: Path, result: ScanResult) -> set[str]:
+    def _analyze_manifest(self, root: Path, manifests: list[Path], result: ScanResult) -> set[str]:
         """Record SwiftPM + framework hints; return the set of *direct* dependency
         identities declared in the manifest (used to mark resolved pins direct)."""
         direct: set[str] = set()
-        for manifest in root.rglob("Package.swift"):
-            if any(part in SKIP_DIRS for part in manifest.parts):
+        for manifest in manifests:
+            text = read_source(manifest)
+            if text is None:
                 continue
-            try:
-                text = manifest.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            rel = self._rel(manifest, root)
+            rel_path = rel(manifest, root)
             result.framework_hints.append(FrameworkHint(
-                hint="SwiftPM", file=rel, line=1,
+                hint="SwiftPM", file=rel_path, line=1,
                 evidence_text="Package.swift present — Swift Package Manager project."))
             for m in _PACKAGE_URL_RE.finditer(text):
                 url = m.group(1)
@@ -131,21 +147,22 @@ class SwiftAnalyzer:
                 for key, label in _FRAMEWORK_HINTS.items():
                     if key in identity:
                         result.framework_hints.append(FrameworkHint(
-                            hint=label, file=rel, line=_line_of(text, url) or 1,
+                            hint=label, file=rel_path, line=_line_of(text, url) or 1,
                             evidence_text=f"Declared dependency: {url}"))
         return direct
 
     # ---------- Package.resolved (SBOM) ----------
 
-    def _analyze_resolved(self, root: Path, result: ScanResult, direct: set[str]) -> None:
-        for resolved in root.rglob("Package.resolved"):
-            if any(part in SKIP_DIRS for part in resolved.parts):
+    def _analyze_resolved(self, root: Path, resolved_files: list[Path], result: ScanResult, direct: set[str]) -> None:
+        for resolved in resolved_files:
+            text = read_source(resolved)
+            if text is None:
                 continue
             try:
-                data = json.loads(resolved.read_text(encoding="utf-8", errors="replace"))
-            except (OSError, json.JSONDecodeError):
+                data = json.loads(text)
+            except json.JSONDecodeError:
                 continue  # a malformed pin file must not abort the scan
-            rel = self._rel(resolved, root)
+            rel_path = rel(resolved, root)
             for pin in _iter_pins(data):
                 identity = (pin.get("identity") or pin.get("package") or "").lower()
                 if not identity:
@@ -157,7 +174,7 @@ class SwiftAnalyzer:
                     name=identity,
                     version=version,
                     ecosystem="swiftpm",
-                    file=rel,
+                    file=rel_path,
                     resolved=True,
                     direct=identity in direct,
                     evidence_text=location or None,
@@ -166,32 +183,20 @@ class SwiftAnalyzer:
 
     # ---------- Entrypoints ----------
 
-    def _analyze_entrypoints(self, root: Path, result: ScanResult) -> None:
-        for path in root.rglob("*.swift"):
-            if any(part in SKIP_DIRS for part in path.parts):
+    def _analyze_entrypoints(self, root: Path, sources: list[Path], result: ScanResult) -> None:
+        for path in sources:
+            text = read_source(path)
+            if text is None:
                 continue
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            rel = self._rel(path, root)
+            rel_path = rel(path, root)
             if path.name == "main.swift":
                 result.entrypoint_hints.append(EntrypointHint(
                     hint="main.swift (top-level executable entrypoint)",
-                    file=rel, line=1, evidence_text="Swift top-level main.swift"))
+                    file=rel_path, line=1, evidence_text="Swift top-level main.swift"))
             elif "@main" in text:
                 result.entrypoint_hints.append(EntrypointHint(
                     hint="@main attribute (executable entrypoint)",
-                    file=rel, line=_line_of(text, "@main") or 1, evidence_text="@main"))
-
-    # ---------- helpers ----------
-
-    @staticmethod
-    def _rel(path: Path, root: Path) -> str:
-        try:
-            return str(path.resolve().relative_to(root)).replace("\\", "/")
-        except ValueError:
-            return path.name
+                    file=rel_path, line=_line_of(text, "@main") or 1, evidence_text="@main"))
 
 
 def _iter_pins(data: object):
