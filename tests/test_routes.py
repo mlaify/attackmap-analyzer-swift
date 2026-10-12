@@ -616,3 +616,26 @@ def test_identity_check_must_precede_every_exit(tmp_path: Path) -> None:
         (route,) = _routes(tmp_path / name, {"Sources/App/App.swift": text})
         expected = "required" if name in ("first", "401-guard-first") else "unknown"
         assert route.auth == expected, name
+
+
+def test_only_strict_identity_guards_count(tmp_path: Path) -> None:
+    conditions = {
+        "guard open || req.auth.has(User.self)": "unknown",
+        "guard isPublic || context.identity != nil": "unknown",
+        "guard let u = context.identity ?? Guest()": "unknown",
+        "guard context.identity == nil": "unknown",
+        "guard !context.identity.isEmpty": "unknown",
+        "guard let u = cache.user": "unknown",
+        "guard let u = context.identity, u.isAdmin || open": "unknown",
+        "guard let u = context.identity": "required",
+        "guard context.identity != nil && context.identity.isActive": "required",
+        "guard let user = context.currentUser, let ownerId = user.id": "required",
+        "guard let u = req.auth.get(User.self)": "required",
+    }
+    for i, (condition, expected) in enumerate(conditions.items()):
+        text = (
+            "import Vapor\nfunc routes(_ app: Application) {\n    app.get(\"x\") { req -> String in\n"
+            f"        {condition} else {{ throw Abort(.unauthorized) }}\n        return \"ok\"\n    }}\n}}\n"
+        )
+        (route,) = _routes(tmp_path / str(i), {"Sources/App/routes.swift": text})
+        assert route.auth == expected, condition

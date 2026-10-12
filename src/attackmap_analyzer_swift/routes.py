@@ -88,13 +88,33 @@ _PATH_PARAM_CTOR = re.compile(r'(?:PathComponent)?\.(parameter|constant)\(\s*"([
 _HANDLER_GUARD = re.compile(
     r"\bauth[ \t]*\.[ \t]*require[ \t]*\("
     r"|\brequireIdentity[ \t]*\("
-    # `guard let user = context.identity else { throw HTTPError(.unauthorized) }`: a
-    # guard on the request's identity that answers 401. (A login handler's
-    # `guard let user = found else { throw .unauthorized }` checks credentials,
-    # not the caller, so it doesn't count.)
-    r"|\bguard\b[^{\n]{0,120}?\b(?:context|req|request)[ \t]*\.[ \t]*(?:identity|currentUser|user|auth)\b"
-    r"[^{\n]{0,120}\belse[ \t]*\{[ \t\r\n]*throw[ \t]+(?:HTTPError|Abort)[ \t]*\([ \t]*\.unauthorized"
+    # A `guard ... else { throw HTTPError(.unauthorized) }`; its condition is
+    # checked by `_strict_identity_condition` (only a plain binding of, or a
+    # nil test on, the request's identity counts).
+    r"|\bguard\b(?P<cond>[^{\n]{1,240}?)\belse[ \t]*\{[ \t\r\n]*throw[ \t]+(?:HTTPError|Abort)[ \t]*\([ \t]*\.unauthorized"
 )
+# The caller's identity: `context.identity`, `req.auth.get(User.self)`, ...
+_IDENTITY_REF = (
+    r"(?:context|req|request)[ \t]*\.[ \t]*"
+    r"(?:identity|currentUser|user|auth[ \t]*\.[ \t]*get[ \t]*\([ \t]*[\w.]{1,80}[ \t]*\))"
+)
+# The whole first clause of the guard: `let u = <ref>` or `<ref> != nil`
+# (optionally `&& <ref>.<member>`).
+_IDENTITY_CLAUSE = re.compile(
+    r"[ \t]*(?:(?:let|var)[ \t]+\w{1,60}(?:[ \t]*:[ \t]*[\w.<>]{1,60}[?]?)?[ \t]*=[ \t]*" + _IDENTITY_REF
+    + r"|" + _IDENTITY_REF + r"[ \t]*!=[ \t]*nil(?:[ \t]*&&[ \t]*" + _IDENTITY_REF + r"(?:[ \t]*\.[ \t]*\w{1,60}){1,4})?)[ \t]*"
+)
+_WEAKENING = re.compile(r"\|\||\?\?|==[ \t]*nil|!(?!=)")
+
+
+def _strict_identity_condition(condition: str) -> bool:
+    """`guard let user = context.identity, let id = user.id` -> True;
+    anything with `||`, `??`, `== nil` or a `!` (negation / force unwrap),
+    or whose first clause isn't the identity itself, -> False."""
+    if _WEAKENING.search(condition):
+        return False
+    first = condition.split(",", 1)[0]
+    return _IDENTITY_CLAUSE.fullmatch(first) is not None
 
 _MAX_CHAIN = 24
 _MAX_DEPTH = 8
@@ -1064,7 +1084,10 @@ def _enforced_check(f: SwiftFile, handler: tuple[int, int], m: re.Match[str], fi
     if k > handler[0] and (text[k] in _CONTINUES or f.src.in_masked(k) and text[k] != '"'):
         return None
     if m.group(0).startswith("guard"):
-        ok = not text[statement:m.start()].strip()  # the guard is the statement
+        # The guard is the statement, and it guards on the caller's identity
+        # (a login handler's `guard let user = found else { throw .unauthorized }`
+        # checks credentials, not the caller).
+        ok = not text[statement:m.start()].strip() and _strict_identity_condition(m.group("cond") or "")
     else:
         ok = _ENFORCED_CALL_PREFIX.fullmatch(text, statement, m.start()) is not None
     if not ok:
