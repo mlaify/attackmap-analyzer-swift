@@ -535,3 +535,59 @@ def test_many_functions_and_mutations_stay_fast() -> None:
         for i in range(3000)
     )
     assert _timed({"m.swift": "import Hummingbird\n" + funcs}) < 3.0
+
+
+# ---------- Review round 2 ----------
+
+
+def test_only_unconditional_top_level_identity_checks_count(tmp_path: Path) -> None:
+    def handler(body: str) -> str:
+        return "    router.get(\"/x\") { request, context in\n" + body + "        return \"ok\"\n    }\n"
+
+    cases = {
+        "if": "        if flag { _ = try context.requireIdentity() }\n",
+        "guard-else": "        guard flag else { _ = try context.requireIdentity(); return \"no\" }\n",
+        "switch": "        switch mode {\n        case .a: _ = try context.requireIdentity()\n        default: break\n        }\n",
+        "do-catch": "        do { _ = try context.requireIdentity() } catch { }\n",
+        "closure": "        let check = { _ = try context.requireIdentity() }\n",
+        "try-optional-await": "        let user = try? await context.requireIdentity()\n",
+        "try-optional-newline": "        let user = try?\n            context.requireIdentity()\n",
+        "condition": "        if let user = try? context.requireIdentity() { print(user) }\n",
+        "plain": "        let user = try await context.requireIdentity()\n",
+        "statement": "        _ = try request.auth.require(User.self)\n",
+    }
+    for name, body in cases.items():
+        text = "import Hummingbird\nfunc build(_ router: Router<Context>) {\n" + handler(body) + "}\n"
+        (route,) = _routes(tmp_path / name, {"Sources/App/App.swift": text})
+        expected = "required" if name in ("plain", "statement") else "unknown"
+        assert route.auth == expected, name
+
+
+def test_deep_sibling_nesting_does_not_hide_an_if(tmp_path: Path) -> None:
+    deep = "{" * 300 + "}" * 300
+    text = (
+        "import Hummingbird\nfunc build(_ router: Router<Context>, flag: Bool) {\n"
+        f"    if flag {{\n        let noise = [{deep}]\n        router.add(middleware: IsAuthenticatedMiddleware())\n    }}\n"
+        "    router.get(\"/x\") { _, _ in \"x\" }\n}\n"
+    )
+    (route,) = _routes(tmp_path, {"Sources/App/App.swift": text})
+    assert route.auth == "unknown"
+
+
+def test_many_middleware_statements_and_routes_stay_fast() -> None:
+    adds = "".join(f"    router.add(middleware: Log{i}Middleware())\n" for i in range(4000))
+    gets = "".join(f'    router.get("/r{i}") {{ _, _ in "" }}\n' for i in range(4000))
+    text = "import Hummingbird\nfunc build(_ router: Router<Context>) {\n" + adds + gets + "}\n"
+    assert len(text) > 290_000
+    assert _timed({"m.swift": text}) < 3.0
+    routes = extract_repo_routes([("m.swift", text + "func later(_ router: Router<Context>) {\n    router.add(middleware: IsAuthenticatedMiddleware())\n    router.get(\"/z\") { _, _ in \"\" }\n}\n")])
+    assert routes["m.swift"][-1].auth == "required"
+
+
+def test_many_same_named_handlers_stay_fast() -> None:
+    controllers = "".join(
+        f"struct C{i} {{\n    func addRoutes(to group: RouterGroup<Context>) {{\n        group.get(\"x\", use: list)\n    }}\n"
+        f"    func list(_ r: Request, context: Context) async throws -> String {{ \"\" }}\n}}\n"
+        for i in range(6000)
+    )
+    assert _timed({"c.swift": "import Hummingbird\n" + controllers}) < 4.0

@@ -95,7 +95,6 @@ _HANDLER_GUARD = re.compile(
 )
 
 _MAX_CHAIN = 24
-_MAX_NESTING_WALK = 256
 _MAX_DEPTH = 8
 _MAX_MOUNTS = 16
 _PATH_EXPR_MAX = 60
@@ -255,44 +254,67 @@ def _method(value: str) -> str | None:
 
 class _SpanIndex:
     """Innermost-enclosing lookup over properly nested (open, close, payload)
-    spans: a bisect plus a bounded walk up parent links."""
+    spans. A sweep over the open/close events records which span is innermost
+    after each event, so a lookup is one bisect, at any nesting depth."""
 
     def __init__(self, spans) -> None:
         self.spans = sorted(spans, key=lambda s: (s[0], -s[1]))
-        self.opens = [s[0] for s in self.spans]
-        self.parent: list[int] = []
+        events: list[tuple[int, int, int]] = []  # (position, order, span index or -1 for a close)
+        for i, span in enumerate(self.spans):
+            events.append((span[0], 1, i))
+            events.append((span[1], 0, -1))
+        events.sort()
+        self.positions: list[int] = []
+        self.innermost_after: list[int] = []
         stack: list[int] = []
-        for i, (open_, _close, *_rest) in enumerate(self.spans):
-            while stack and self.spans[stack[-1]][1] < open_:
+        for position, _order, index in events:
+            if index >= 0:
+                stack.append(index)
+            elif stack:
                 stack.pop()
-            self.parent.append(stack[-1] if stack else -1)
-            stack.append(i)
+            self.positions.append(position)
+            self.innermost_after.append(stack[-1] if stack else -1)
 
     def innermost(self, offset: int):
-        i = bisect.bisect_left(self.opens, offset) - 1
-        for _ in range(_MAX_NESTING_WALK):
-            if i < 0:
-                return None
-            span = self.spans[i]
-            if span[0] < offset < span[1]:
-                return span
-            i = self.parent[i]
-        return None
+        k = bisect.bisect_left(self.positions, offset) - 1
+        if k < 0:
+            return None
+        i = self.innermost_after[k]
+        if i < 0:
+            return None
+        span = self.spans[i]
+        return span if span[0] < offset < span[1] else None
 
-    def containing(self, offset: int):
-        """Enclosing spans, innermost first (bounded)."""
-        span = self.innermost(offset)
-        if span is None:
-            return
-        i = bisect.bisect_left(self.opens, span[0])
-        while i < len(self.spans) and self.spans[i] is not span:
-            i += 1
-        for _ in range(_MAX_NESTING_WALK):
-            if i < 0:
-                return
-            if self.spans[i][0] < offset < self.spans[i][1]:
-                yield self.spans[i]
-            i = self.parent[i]
+
+# Guards a route reports by name; past this many middleware statements only
+# the enforcing ones are added (the auth decision never depends on the rest).
+_MAX_LISTED_GUARDS = 16
+
+
+class _MutationRun:
+    """The `x.add(middleware:)` statements on one router name in one
+    function, in source order, with each position's next unconditional
+    enforcing guard precomputed so a lookup is two bisects."""
+
+    def __init__(self, items: list[tuple[int, Guard]]) -> None:
+        items.sort(key=lambda item: item[0])
+        self.offsets = [at for at, _ in items]
+        self.guards = [g for _, g in items]
+        self.next_enforcing = [len(items)] * (len(items) + 1)
+        for i in range(len(items) - 1, -1, -1):
+            g = self.guards[i]
+            self.next_enforcing[i] = i if (g.enforcing and not g.conditional) else self.next_enforcing[i + 1]
+
+    def between(self, since: int, before: int) -> list[Guard]:
+        lo = bisect.bisect_right(self.offsets, since)
+        hi = bisect.bisect_left(self.offsets, before)
+        if lo >= hi:
+            return []
+        listed = self.guards[lo:min(hi, lo + _MAX_LISTED_GUARDS)]
+        k = self.next_enforcing[lo + len(listed)] if lo + len(listed) < hi else hi
+        if k < hi:
+            listed.append(self.guards[k])
+        return listed
 
 
 def _closure_param(text: str, brace: int, close: int) -> str:
@@ -344,7 +366,10 @@ class SwiftFile:
         self.function_index = _SpanIndex([])
         self.type_index = _SpanIndex([])
         self.block_index = _SpanIndex([])
-        self.closure_index = _SpanIndex([])
+        self.paren_index = _SpanIndex([])
+        self.closures_by_param: dict[str, _SpanIndex] = {}
+        self.functions_by_owner: dict[tuple[str | None, str], list[tuple[int, int]]] = {}
+        self.mutation_runs: dict[tuple[str, int], _MutationRun] = {}
         self.src: Source = swiftsrc.parse(text) if self.is_server else Source(text)
         if self.is_server:
             self._index()
@@ -401,9 +426,19 @@ class SwiftFile:
         self.function_index = _SpanIndex([(o, c, n) for n, spans in self.functions.items() for o, c in spans])
         self.type_index = _SpanIndex(self.types)
         self.block_index = _SpanIndex([(o, c, "") for o, c in src.pairs.items() if text[o] == "{"])
-        self.closure_index = _SpanIndex([(c.open, c.close, c) for c in self.closures])
+        self.paren_index = _SpanIndex([(o, c, "") for o, c in src.pairs.items() if text[o] in "(["])
+        by_param: dict[str, list[tuple[int, int, _Closure]]] = {}
+        for c in self.closures:
+            by_param.setdefault(c.param, []).append((c.open, c.close, c))
+        self.closures_by_param = {name: _SpanIndex(spans) for name, spans in by_param.items()}
+        # (declaring type or None, func name) -> body spans, for `use:` handlers.
+        for name, spans in self.functions.items():
+            for span in spans:
+                declared = self.type_index.innermost(span[0])
+                self.functions_by_owner.setdefault((declared[2] if declared else None, name), []).append(span)
         for m in _PP_DIRECTIVE.finditer(text):
             (self.pp_endif if m.group(1) == "endif" else self.pp_if).append(m.start())
+        grouped: dict[tuple[str, int], list[tuple[int, Guard]]] = {}
         for m in _MUTATION.finditer(text):
             if not self.code(m.start()):
                 continue
@@ -417,10 +452,15 @@ class SwiftFile:
             if any(s.closure is not None and s.args is None and s.name != "addMiddleware" for s in chain[1:]):
                 continue
             conditional = self.is_conditional(m.start())
+            function = self.function_index.innermost(m.start())
             for guard in self._mutation_guard(m.start(), start) or ():
                 if conditional:
                     guard = Guard(guard.name, guard.enforcing, guard.evidence, conditional=True)
                 self.mutations.setdefault(chain[0].name, []).append((m.start(), guard))
+                grouped.setdefault((chain[0].name, function[0] if function is not None else -1), []).append(
+                    (m.start(), guard)
+                )
+        self.mutation_runs = {key: _MutationRun(items) for key, items in grouped.items()}
 
     def _mutation_guard(self, dot: int, start: int) -> tuple[Guard, ...] | None:
         text, src = self.text, self.src
@@ -462,21 +502,18 @@ class SwiftFile:
         closed = bisect.bisect_left(self.pp_endif, offset) - bisect.bisect_left(self.pp_endif, start)
         return opened > closed
 
+    def mutation_run(self, name: str, offset: int) -> _MutationRun | None:
+        function = self.function_index.innermost(offset)
+        return self.mutation_runs.get((name, function[0] if function is not None else -1))
+
     def function_body(self, name: str, near: int, type_name: str | None = None) -> tuple[int, int] | None:
         """Body of ``func name`` declared in ``type_name`` (default: the type
         enclosing ``near``, or top level), across its extensions in this file.
         None unless exactly one candidate: an ambiguous handler stays unseen."""
-        spans = self.functions.get(name)
-        if not spans:
-            return None
         if type_name is None:
             owner = self.enclosing_type(near)
             type_name = owner[2] if owner is not None else None
-        candidates = []
-        for span in spans:
-            declared = self.enclosing_type(span[0])
-            if (declared[2] if declared is not None else None) == type_name:
-                candidates.append(span)
+        candidates = self.functions_by_owner.get((type_name, name), ())
         return candidates[0] if len(candidates) == 1 else None
 
 
@@ -738,11 +775,9 @@ class RouteResolver:
         if depth > _MAX_DEPTH:
             return None
         # Innermost group closure binding this name ($0 or its parameter).
-        best: _Closure | None = None
-        for span in f.closure_index.containing(offset):
-            if span[2].param == name:
-                best = span[2]
-                break
+        index = f.closures_by_param.get(name)
+        found = index.innermost(offset) if index is not None else None
+        best: _Closure | None = found[2] if found is not None else None
         if best is not None:
             key = ("closure", best.open)
             if key not in f.scope_cache:
@@ -779,11 +814,13 @@ class RouteResolver:
         return None
 
     def _with_mutations(self, f: SwiftFile, name: str, offset: int, scope: Scope, since: int) -> Scope:
-        """Apply `name.add(middleware: X)` statements made before ``offset``."""
-        added = [
-            g for at, g in f.mutations.get(name, ())
-            if since < at < offset and g not in scope.guards and _same_function(f, at, offset)
-        ]
+        """Apply `name.add(middleware: X)` statements made before ``offset``
+        (and after ``since``) in the same function."""
+        run = f.mutation_run(name, offset)
+        if run is None:
+            return scope
+        added = run.between(since, offset)
+        added = [g for g in added if g not in scope.guards]
         if not added:
             return scope
         return Scope(scope.prefix, scope.guards + tuple(dict.fromkeys(added)))
@@ -977,7 +1014,24 @@ def _handler_span(f: SwiftFile, dot: int, after: int, use: str | None) -> tuple[
 
 # `try? req.auth.require(...)` / `(try? context.requireIdentity())` swallow the
 # error: the handler carries on for anonymous callers.
-_TRY_OPTIONAL_TAIL = re.compile(r"try\?[ \t]*(?:[\w$]{1,60}[ \t]*\.[ \t]*){0,6}$")
+# What may precede an identity check on its line for it to count: the check
+# is the statement itself, a plain `try` (not `try?`) whose error leaves the
+# handler, optionally bound: `let user = try await req.auth.require(User.self)`.
+_ENFORCED_CALL_PREFIX = re.compile(
+    r"[ \t]*(?:(?:let|var)[ \t]+[A-Za-z_]\w{0,60}(?:[ \t]*:[^=\n]{0,80})?[ \t]*=[ \t]*|_[ \t]*=[ \t]*)?"
+    r"try!?[ \t]+(?:await[ \t]+)?(?:[\w$]{1,60}[ \t]*\.[ \t]*){1,6}"
+)
+
+
+def _top_level_statement(f: SwiftFile, handler: tuple[int, int], offset: int) -> bool:
+    """True when ``offset`` is directly in the handler body: not inside an
+    `if` / `guard ... else` / `switch` / `do` / `catch` block or a nested
+    closure, and not inside parentheses (a condition or an argument)."""
+    block = f.block_index.innermost(offset)
+    if block is None or block[0] != handler[0]:
+        return False
+    paren = f.paren_index.innermost(offset)
+    return paren is None or paren[0] < handler[0]
 
 
 def _handler_checks(f: SwiftFile, handler: tuple[int, int]) -> tuple[tuple[str, str] | None, str | None]:
@@ -989,16 +1043,21 @@ def _handler_checks(f: SwiftFile, handler: tuple[int, int]) -> tuple[tuple[str, 
     text = f.text
     identity: tuple[str, str] | None = None
     for m in _HANDLER_GUARD.finditer(text, handler[0], handler[1]):
-        if not f.code(m.start()):
+        if not f.code(m.start()) or not _top_level_statement(f, handler, m.start()):
             continue
-        if _TRY_OPTIONAL_TAIL.search(text, max(handler[0], m.start() - 120), m.start()):
-            continue
+        statement = max(text.rfind("\n", handler[0], m.start()), text.rfind(";", handler[0], m.start()), handler[0]) + 1
+        if m.group(0).startswith("guard"):
+            ok = not text[statement:m.start()].strip()  # the guard is the statement
+        else:
+            ok = _ENFORCED_CALL_PREFIX.fullmatch(text, statement, m.start()) is not None
+        if not ok:
+            continue  # `try?`, `if let ... = try? ...`, a condition, a line break after `try`
         identity = (_handler_guard_name(m.group(0)), clip(_line_at(text, m.start())))
         break
     role: str | None = None
     for m in _HANDLER_ROLE.finditer(text, handler[0], handler[1]):
         line = _line_at(text, m.start()).strip()
-        if f.code(m.start()) and line.startswith("guard "):
+        if f.code(m.start()) and line.startswith("guard ") and _top_level_statement(f, handler, m.start()):
             role = clip(line, 80)
             break
     f.handler_cache[handler] = (identity, role)
