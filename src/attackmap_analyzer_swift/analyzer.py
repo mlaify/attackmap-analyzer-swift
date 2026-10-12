@@ -4,9 +4,13 @@
   (formats v1/v2/v3) and CocoaPods' ``Podfile.lock``.
 - Server-side routes (#187): Vapor 4 and Hummingbird 1.x/2.x, with prefixes,
   mounts and route-level auth (``routes.py``).
+- The iOS/macOS app attack surface (#188, ``apple_surface.py``): App Transport
+  Security exceptions and custom URL schemes in ``Info.plist``, weakening
+  entitlements and universal links, secrets in ``.xcconfig`` files, the
+  Carthage SBOM, and in Swift code URL-scheme / universal-link / XPC entry
+  points, WKWebView script injection, secrets in UserDefaults or on the
+  pasteboard, unvalidated XPC peers and dynamic dispatch on built strings.
 - Framework hints and ``main.swift`` / ``@main`` entrypoints.
-
-The iOS/macOS app attack surface (#188) lands in a later slice.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from .contracts import (
     Route,
     ScanResult,
 )
+from . import apple_surface
 from .routes import extract_repo_routes
 from .sbom import parse_podfile_lock
 
@@ -92,12 +97,12 @@ class SwiftAnalyzer:
         name="swift",
         display_name="Swift Analyzer",
         version="0.1.0",
-        description="Swift ecosystem analyzer: Vapor/Hummingbird routes with route-level auth, and a SwiftPM/CocoaPods dependency SBOM. The iOS/macOS app surface lands in a later slice.",
-        scope="Swift source trees and SwiftPM/Xcode projects: server-side Swift routes (Vapor, Hummingbird), the SwiftPM toolchain and frameworks in the manifest, and resolved Package.resolved / Podfile.lock dependencies for CVE/SBOM.",
+        description="Swift ecosystem analyzer: Vapor/Hummingbird routes with route-level auth, the iOS/macOS app attack surface (ATS, URL schemes, entitlements, WKWebView, UserDefaults, XPC), and a SwiftPM/CocoaPods/Carthage dependency SBOM.",
+        scope="Swift source trees and SwiftPM/Xcode projects: server-side Swift routes (Vapor, Hummingbird), iOS/macOS app projects (Info.plist, entitlements, xcconfig), and resolved Package.resolved / Podfile.lock / Cartfile.resolved dependencies for CVE/SBOM.",
         targets=["swift", "swiftpm", "vapor", "hummingbird"],
         languages=["swift"],
         priority=20,
-        experimental=True,  # Heuristic route extraction; app surface still to come.
+        experimental=True,  # Heuristic route and app-surface extraction.
         enabled_by_default=False,  # opt-in via `-m swift` while experimental (AttackMap#221)
     )
 
@@ -147,7 +152,22 @@ class SwiftAnalyzer:
         self._analyze_podfile_locks(root, pod_locks, result)
         self._analyze_entrypoints(root, sources, result)
         self._analyze_routes(root, sources, manifests, result)
+        self._analyze_app_surface(root, sources, result)
         return result
+
+    # ---------- iOS/macOS app surface (#188) ----------
+
+    def _analyze_app_surface(self, root: Path, sources: list[Path], result: ScanResult) -> None:
+        apple_surface.analyze_project_files(root, result, SKIP_DIRS, is_test=_is_test_path)
+        handlers: list[apple_surface.Handler] = []
+        for path in sources:
+            rel_path = rel(path, root)
+            if _is_test_path(rel_path):
+                continue
+            text = read_source(path)
+            if text is not None:
+                apple_surface.analyze_swift_source(rel_path, text, result, handlers)
+        apple_surface.report_url_schemes(result, handlers)
 
     # ---------- Routes (#187) ----------
 
