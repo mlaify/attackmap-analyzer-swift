@@ -93,8 +93,8 @@ def test_ats_exceptions_and_url_scheme_with_file_and_line(tmp_path: Path) -> Non
         ("App/Info.plist", 27, "low"),
     ]
     assert ats[0].evidence_text == "NSAppTransportSecurity.NSAllowsArbitraryLoads = true"
-    assert "legacy.example.com" in (ats[1].evidence_text or "")
-    assert "TLSv1.0" in (ats[2].evidence_text or "")
+    assert ats[1].evidence_text == "NSExceptionDomains.legacy.example.com: NSExceptionAllowsInsecureHTTPLoads"
+    assert ats[2].evidence_text == "NSExceptionDomains.old-tls.example.com: NSExceptionMinimumTLSVersion = TLSv1.0"
     scheme = _issues(result, "apple_custom_url_scheme")
     assert [(i.file, i.line, i.severity) for i in scheme] == [("App/Info.plist", 12, "low")]
     assert scheme[0].evidence_text == "CFBundleURLSchemes: exampleapp://; handled at App/SceneDelegate.swift:3"
