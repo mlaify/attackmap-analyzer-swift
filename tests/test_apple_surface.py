@@ -348,3 +348,33 @@ def test_xpc_peer_validated_through_a_helper_is_not_flagged(tmp_path: Path) -> N
         source = source.replace("NSXPCListener.service()", 'NSXPCListener(machServiceName: "x")')
         result = _analyze(tmp_path / name, {"Helper/main.swift": source})
         assert _issues(result, "apple_xpc_unvalidated_peer") == [], name
+
+
+def test_xpc_targets_are_finer_than_the_top_directory(tmp_path: Path) -> None:
+    delegate = XPC_TEMPLATE.split("let delegate")[0]
+    mach = 'let listener = NSXPCListener(machServiceName: "com.example.helper")\n'
+    # Two SwiftPM targets under one Sources/: the mach service is elsewhere.
+    result = _analyze(tmp_path / "spm", {"Sources/XPCSvc/Delegate.swift": delegate, "Sources/Helper/main.swift": mach})
+    assert [i.severity for i in _issues(result, "apple_xpc_unvalidated_peer")] == ["low"]
+    result = _analyze(tmp_path / "spm2", {"Sources/Helper/Delegate.swift": delegate, "Sources/Helper/main.swift": mach})
+    assert [i.severity for i in _issues(result, "apple_xpc_unvalidated_peer")] == ["high"]
+    # The delegate's own file sets up a bundled service: low despite a mach service nearby.
+    result = _analyze(tmp_path / "own", {"Helper/main.swift": XPC_TEMPLATE, "Helper/Other.swift": mach})
+    assert [i.severity for i in _issues(result, "apple_xpc_unvalidated_peer")] == ["low"]
+
+
+def test_finalize_xpc_is_linear() -> None:
+    import time
+
+    from attackmap_analyzer_swift.apple_surface import XPC_MACH_HINT, finalize_xpc
+    from attackmap_analyzer_swift.contracts import AppSurfaceIssue, EntrypointHint, ScanResult
+
+    result = ScanResult(root=".")
+    for i in range(8000):
+        result.entrypoint_hints.append(EntrypointHint(hint=XPC_MACH_HINT, file=f"Mach{i}/main.swift", line=1))
+        result.app_surface_issues.append(AppSurfaceIssue(
+            kind="apple_xpc_unvalidated_peer", file=f"Delegate{i}/D.swift", line=1, severity="high"))
+    start = time.perf_counter()
+    finalize_xpc(result)
+    assert time.perf_counter() - start < 1.0
+    assert {i.severity for i in result.app_surface_issues} == {"low"}

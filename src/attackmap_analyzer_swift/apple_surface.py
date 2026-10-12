@@ -342,6 +342,9 @@ _XPC_ACCEPT = re.compile(
     r"\bfunc[ \t]+listener[ \t]*\([^)]{0,200}\bshouldAcceptNewConnection[ \t]+(\w{1,60})[ \t]*:[^{]{0,200}\{"
 )
 XPC_MACH_HINT = "xpc_service: mach service (NSXPCListener(machServiceName:))"
+# Every XPC entry point starts with this; all but the mach one are local
+# (a bundled XPC service or an anonymous listener), in Swift and ObjC.
+_XPC_HINT_PREFIX = "xpc_service: "
 _XPC_PEER_CHECK = re.compile(
     r"(?i)auditToken|processIdentifier|effectiveUserIdentifier|effectiveGroupIdentifier|CodeSigningRequirement"
     r"|\bSecCode|\bSecStaticCode|\bSecRequirement|\bSecTask|kSecGuestAttribute"
@@ -395,25 +398,41 @@ def xpc_peer_checked(body: str, connection: str) -> bool:
     return False
 
 
+def _xpc_target(path: str) -> str:
+    """The target a source belongs to: `Sources/<Target>` for SwiftPM layouts,
+    else the file's directory (one Xcode target folder)."""
+    parts = path.split("/")
+    if "Sources" in parts[:-2]:
+        i = parts.index("Sources")
+        return "/".join(parts[: i + 2])
+    return posixpath.dirname(path)
+
+
 def finalize_xpc(result: ScanResult) -> None:
     """An XPC listener delegate is high only when a mach service
-    (`NSXPCListener(machServiceName:)`) is registered in the same file or
-    target (top-level directory): any local process can look one up. A
+    (`NSXPCListener(machServiceName:)`) is registered in the same file, or in
+    the same target when the delegate's own file doesn't set up a bundled or
+    anonymous listener: any local process can look a mach service up. A
     bundled XPC service or an anonymous listener is reachable only by its
     parent app or an endpoint holder, so the issue drops to low."""
-    mach = [h.file for h in result.entrypoint_hints if h.hint == XPC_MACH_HINT]
-
-    def target(path: str) -> str:
-        return path.split("/", 1)[0] if "/" in path else ""
-
+    mach_files: set[str] = set()
+    local_files: set[str] = set()
+    for hint in result.entrypoint_hints:
+        if hint.hint == XPC_MACH_HINT:
+            mach_files.add(hint.file)
+        elif hint.hint.startswith(_XPC_HINT_PREFIX):
+            local_files.add(hint.file)
+    mach_targets = {_xpc_target(f) for f in mach_files}
     for issue in result.app_surface_issues:
         if issue.kind != "apple_xpc_unvalidated_peer" or issue.severity != "high":
             continue
-        if any(f == issue.file or (target(f) and target(f) == target(issue.file)) for f in mach):
+        if issue.file in mach_files:
+            continue
+        if issue.file not in local_files and _xpc_target(issue.file) in mach_targets:
             continue
         issue.severity = "low"
         issue.evidence_text = (issue.evidence_text or "") + (
-            "; no NSXPCListener(machServiceName:) in this target, so likely a bundled XPC service or "
+            "; no NSXPCListener(machServiceName:) in this file or target, so likely a bundled XPC service or "
             "anonymous listener reachable only by its parent app"
         )
 
