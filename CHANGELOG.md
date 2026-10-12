@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Vapor 4 and Hummingbird 1.x/2.x route extraction (mlaify/AttackMap#187): verb calls on routers, `grouped`/`group` prefixes (closures, bindings, chains), `RouteCollection` and controller mounts, and computed paths kept as `$(expr)`. Routes carry `auth`/`guards`/`guard_evidence` (mlaify/AttackMap#256): `required` from Vapor guard/redirect middleware, Hummingbird `IsAuthenticatedMiddleware` / authorization-policy middleware, or a handler that requires the caller's identity; authenticators alone stay `unknown`; `try?` identity checks, middleware added under `if`/`#if`, ambiguous `use:` handlers and unresolvable mounts never make a route `required`. Test targets are skipped.
+- The iOS/macOS app attack surface (mlaify/AttackMap#188, #1), emitted as `AppSurfaceIssue`s (requires mlaify/AttackMap#347):
+  - App Transport Security exceptions and custom URL schemes from `Info.plist` (XML and binary, via `plistlib`);
+  - hardened-runtime exceptions, `get-task-allow` and universal links from `*.entitlements`;
+  - secret-named literals in `*.xcconfig` (as hard-coded secrets);
+  - in Swift: URL-scheme / universal-link / XPC entry points, WKWebView script built by interpolating into a JS string literal, secrets in UserDefaults / `@AppStorage` or on the pasteboard, XPC listeners that accept every peer, and dynamic dispatch on built strings.
+- Carthage SBOM: `Cartfile.resolved` pins as `carthage` dependencies, CVE-matched by repository URL.
 - CocoaPods SBOM: `Podfile.lock` pods are inventoried as `cocoapods` dependencies, direct when the Podfile lists them (#1).
 
 ### Changed
