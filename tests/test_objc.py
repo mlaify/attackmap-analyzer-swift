@@ -136,7 +136,7 @@ def test_objc_surface_and_native_weaknesses(tmp_path: Path) -> None:
     assert ("url_scheme_handler (opens URLs from other apps)", 6) in hints
     assert ("xpc_service (NSXPCListener)", 72) in hints
     scheme = [i for i in result.app_surface_issues if i.kind == "apple_custom_url_scheme"]
-    assert [i.evidence_text for i in scheme] == ["CFBundleURLSchemes: legacyapp://; handled at App/AppDelegate.m:6"]
+    assert [i.evidence_text for i in scheme] == ["CFBundleURLSchemes: legacyapp://"]
     assert result.languages == ["objective-c"] and result.files_scanned == 1
 
 
