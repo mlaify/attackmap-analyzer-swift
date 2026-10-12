@@ -265,7 +265,8 @@ def test_swift_code_surface(tmp_path: Path) -> None:
     assert lines("apple_pasteboard_secret") == [(25, "low")]
     assert lines("apple_dynamic_dispatch") == [(29, "medium"), (32, "medium")]
     assert lines("apple_xpc_unvalidated_peer") == [(39, "high")]
-    assert any(h.hint == "xpc_service (NSXPCListener)" and h.line == 38 for h in result.entrypoint_hints)
+    assert any(h.hint == "xpc_service: mach service (NSXPCListener(machServiceName:))" and h.line == 38
+               for h in result.entrypoint_hints)
 
 
 def test_test_targets_are_skipped(tmp_path: Path) -> None:
@@ -300,3 +301,50 @@ def test_garbage_plists_and_sources_never_raise(tmp_path: Path) -> None:
     for cut in range(0, len(SWIFT_SURFACE), 11):
         _write(tmp_path, f"s/Cut{cut}.swift", SWIFT_SURFACE[:cut])
     SwiftAnalyzer().analyze(tmp_path)  # must not raise
+
+
+XPC_TEMPLATE = """import Foundation
+
+class ServiceDelegate: NSObject, NSXPCListenerDelegate {
+    func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
+        newConnection.exportedInterface = NSXPCInterface(with: MyServiceProtocol.self)
+        newConnection.exportedObject = MyService()
+        newConnection.resume()
+        return true
+    }
+}
+
+let delegate = ServiceDelegate()
+let listener = NSXPCListener.service()
+listener.delegate = delegate
+listener.resume()
+"""
+
+
+def test_xpc_severity_depends_on_reachability(tmp_path: Path) -> None:
+    # Apple's XPC Service template: only the parent app can connect.
+    result = _analyze(tmp_path / "bundled", {"MyService/main.swift": XPC_TEMPLATE})
+    (issue,) = _issues(result, "apple_xpc_unvalidated_peer")
+    assert issue.severity == "low" and "bundled XPC service" in (issue.evidence_text or "")
+    # A mach service in the same target: any local process can look it up.
+    mach = XPC_TEMPLATE.replace("NSXPCListener.service()", 'NSXPCListener(machServiceName: "com.example.helper")')
+    result = _analyze(tmp_path / "mach", {"Helper/main.swift": mach})
+    assert [i.severity for i in _issues(result, "apple_xpc_unvalidated_peer")] == ["high"]
+    # The listener in another file of the same target still counts.
+    result = _analyze(tmp_path / "split", {
+        "Helper/Delegate.swift": XPC_TEMPLATE.split("let delegate")[0],
+        "Helper/main.swift": 'let listener = NSXPCListener(machServiceName: "com.example.helper")\n',
+    })
+    assert [i.severity for i in _issues(result, "apple_xpc_unvalidated_peer")] == ["high"]
+
+
+def test_xpc_peer_validated_through_a_helper_is_not_flagged(tmp_path: Path) -> None:
+    for name, check in {
+        "helper-arg": "        guard isTrusted(newConnection) else { return false }\n",
+        "labeled": "        guard verifier.check(connection: newConnection) else { return false }\n",
+        "pid": "        let pid = newConnection.processIdentifier\n",
+    }.items():
+        source = XPC_TEMPLATE.replace("        newConnection.resume()\n", check + "        newConnection.resume()\n")
+        source = source.replace("NSXPCListener.service()", 'NSXPCListener(machServiceName: "x")')
+        result = _analyze(tmp_path / name, {"Helper/main.swift": source})
+        assert _issues(result, "apple_xpc_unvalidated_peer") == [], name

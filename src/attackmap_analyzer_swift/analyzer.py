@@ -168,6 +168,7 @@ class SwiftAnalyzer:
             if text is not None:
                 apple_surface.analyze_swift_source(rel_path, text, result, handlers)
         apple_surface.report_url_schemes(result, handlers)
+        apple_surface.finalize_xpc(result)
 
     # ---------- Routes (#187) ----------
 

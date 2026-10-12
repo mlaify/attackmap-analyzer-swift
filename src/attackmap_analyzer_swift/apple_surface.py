@@ -336,8 +336,12 @@ _UNIVERSAL_LINK_HANDLERS = re.compile(
     r"\bfunc[ \t]+(?:application|scene)[ \t]*\([^)]{0,200}\bcontinue[ \t]+userActivity\b"
     r"|\.onContinueUserActivity[ \t]*\([ \t]*NSUserActivityTypeBrowsingWeb"
 )
-_XPC_LISTENER = re.compile(r"\bNSXPCListener[ \t]*\([ \t]*machServiceName[ \t]*:|\bNSXPCListener[ \t]*\.[ \t]*service[ \t]*\(")
-_XPC_ACCEPT = re.compile(r"\bfunc[ \t]+listener[ \t]*\([^)]{0,200}\bshouldAcceptNewConnection\b[^{]{0,200}\{")
+_XPC_MACH_LISTENER = re.compile(r"\bNSXPCListener[ \t]*\([ \t]*machServiceName[ \t]*:")
+_XPC_LOCAL_LISTENER = re.compile(r"\bNSXPCListener[ \t]*\.[ \t]*(service|anonymous)[ \t]*\(")
+_XPC_ACCEPT = re.compile(
+    r"\bfunc[ \t]+listener[ \t]*\([^)]{0,200}\bshouldAcceptNewConnection[ \t]+(\w{1,60})[ \t]*:[^{]{0,200}\{"
+)
+XPC_MACH_HINT = "xpc_service: mach service (NSXPCListener(machServiceName:))"
 _XPC_PEER_CHECK = re.compile(
     r"(?i)auditToken|processIdentifier|effectiveUserIdentifier|effectiveGroupIdentifier|CodeSigningRequirement"
     r"|\bSecCode|\bSecStaticCode|\bSecRequirement|\bSecTask|kSecGuestAttribute"
@@ -359,6 +363,59 @@ _BUILT_STRING = re.compile(r'\\\(|"[ \t]*\+|\+[ \t]*"|String[ \t]*\([ \t]*format
 _SIMPLE_EXPR = re.compile(r"[\w.?!]{1,200}")
 _EXPR_SEP = re.compile(r"[.?!]+")
 _SANITIZED = re.compile(r"(?i)saniti|escap|encod|json|quoted|jsString|jsLiteral|jsonString")
+
+
+def xpc_peer_checked(body: str, connection: str) -> bool:
+    """True when the accept body checks the peer: audit token / PID /
+    code-signing APIs, a validate/verify/... helper call, or any call the
+    connection is passed to (`isTrusted(newConnection)`, `[self check:conn]`)
+    rather than called on (`newConnection.resume()`)."""
+    if _XPC_PEER_CHECK.search(body):
+        return True
+    if not connection.isidentifier():
+        return False
+    at = body.find(connection)
+    for _ in range(200):
+        if at < 0:
+            return False
+        end = at + len(connection)
+        before = body[max(0, at - 1)]
+        after = body[end] if end < len(body) else ""
+        if (at == 0 or not (before.isalnum() or before == "_")) and not (after.isalnum() or after == "_"):
+            j = at - 1
+            while j >= 0 and body[j] in " \t\n":
+                j -= 1
+            k = end
+            while k < len(body) and body[k] in " \t\n":
+                k += 1
+            passed_in = j >= 0 and body[j] in "(,:" and not (k < len(body) and body[k] == ".")
+            if passed_in:
+                return True
+        at = body.find(connection, end)
+    return False
+
+
+def finalize_xpc(result: ScanResult) -> None:
+    """An XPC listener delegate is high only when a mach service
+    (`NSXPCListener(machServiceName:)`) is registered in the same file or
+    target (top-level directory): any local process can look one up. A
+    bundled XPC service or an anonymous listener is reachable only by its
+    parent app or an endpoint holder, so the issue drops to low."""
+    mach = [h.file for h in result.entrypoint_hints if h.hint == XPC_MACH_HINT]
+
+    def target(path: str) -> str:
+        return path.split("/", 1)[0] if "/" in path else ""
+
+    for issue in result.app_surface_issues:
+        if issue.kind != "apple_xpc_unvalidated_peer" or issue.severity != "high":
+            continue
+        if any(f == issue.file or (target(f) and target(f) == target(issue.file)) for f in mach):
+            continue
+        issue.severity = "low"
+        issue.evidence_text = (issue.evidence_text or "") + (
+            "; no NSXPCListener(machServiceName:) in this target, so likely a bundled XPC service or "
+            "anonymous listener reachable only by its parent app"
+        )
 
 
 def _ident_name(expr: str) -> str | None:
@@ -513,11 +570,18 @@ def analyze_swift_source(rel_path: str, text: str, result: ScanResult, handlers:
                 hint="universal_link_handler (continue userActivity)", file=rel_path,
                 line=line_of(text, m.start()), evidence_text=snippet(m.start()), confidence=0.8,
             ))
-    for m in _XPC_LISTENER.finditer(text):
+    for m in _XPC_MACH_LISTENER.finditer(text):
         if code(m.start()):
             result.entrypoint_hints.append(EntrypointHint(
-                hint="xpc_service (NSXPCListener)", file=rel_path, line=line_of(text, m.start()),
+                hint=XPC_MACH_HINT, file=rel_path, line=line_of(text, m.start()),
                 evidence_text=snippet(m.start()), confidence=0.9,
+            ))
+    for m in _XPC_LOCAL_LISTENER.finditer(text):
+        if code(m.start()):
+            kind = "bundled XPC service" if m.group(1) == "service" else "anonymous listener"
+            result.entrypoint_hints.append(EntrypointHint(
+                hint=f"xpc_service: {kind} (NSXPCListener.{m.group(1)}())", file=rel_path,
+                line=line_of(text, m.start()), evidence_text=snippet(m.start()), confidence=0.9,
             ))
     for m in _XPC_ACCEPT.finditer(text):
         brace = m.end() - 1
@@ -525,7 +589,7 @@ def analyze_swift_source(rel_path: str, text: str, result: ScanResult, handlers:
         if close < 0 or not code(m.start()):
             continue
         body = text[brace:close]
-        if _RETURN_TRUE.search(body) and not _XPC_PEER_CHECK.search(body):
+        if _RETURN_TRUE.search(body) and not xpc_peer_checked(body, m.group(1)):
             result.app_surface_issues.append(AppSurfaceIssue(
                 kind="apple_xpc_unvalidated_peer", file=rel_path, line=line_of(text, m.start()), severity="high",
                 evidence_text="listener(_:shouldAcceptNewConnection:) returns true without checking the peer's audit token or code signature",

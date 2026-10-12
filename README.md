@@ -79,7 +79,11 @@ of the repo are not followed.
     - Secret-named values or keys written to `UserDefaults` (`set(_:forKey:)`,
       `@AppStorage("authToken")`), or copied to `UIPasteboard.general`.
     - `NSXPCListener` services (entry points), and a `shouldAcceptNewConnection` that
-      returns `true` without checking the peer's audit token or code signature (high).
+      returns `true` without checking the peer: no audit token / PID / code-signing
+      requirement, no validate/verify helper, and the connection isn't passed to any call.
+      High when a `NSXPCListener(machServiceName:)` is registered in the same file or
+      target (top-level directory); otherwise low, since a bundled XPC service or anonymous
+      listener is reachable only by its parent app or an endpoint holder.
     - `NSClassFromString` / `NSSelectorFromString` / `dlopen` on a string built at the
       call site.
     - URL-scheme and universal-link handlers as entry points.
