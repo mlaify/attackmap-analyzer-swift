@@ -299,9 +299,9 @@ struct WebController {
     }
 }
 """}))
-    assert routes[("POST", "/$(WebController)/documents")].auth == "required"
+    assert routes[("POST", "/documents")].auth == "required"
     # Rejecting bad credentials in a login handler doesn't gate the route.
-    assert routes[("POST", "/$(WebController)/login")].auth == "unknown"
+    assert routes[("POST", "/login")].auth == "unknown"
 
 
 def test_hummingbird1_app_router(tmp_path: Path) -> None:
@@ -383,3 +383,155 @@ def test_swift_lexer_handles_strings_comments_and_deep_nesting() -> None:
     deep = '"' + '\\("' * 5000 + "x"
     parse(deep)
     parse("(" * 20000 + ")" * 3)
+
+
+# ---------- Review fixes: auth precision ----------
+
+
+def test_try_optional_identity_checks_do_not_guard(tmp_path: Path) -> None:
+    routes = _by_key(_routes(tmp_path, {"Sources/App/routes.swift": """import Vapor
+func routes(_ app: Application) throws {
+    app.get("feed") { req -> String in
+        let user = try? req.auth.require(User.self)
+        return user?.name ?? "anonymous"
+    }
+    app.get("me") { req -> String in
+        let user = try req.auth.require(User.self)
+        return user.name
+    }
+}
+""", "Sources/App/Web.swift": """import Hummingbird
+func web(_ router: Router<Context>) {
+    router.get("/maybe") { _, context in
+        if let user = (try? context.requireIdentity()) { return user.name }
+        return "guest"
+    }
+}
+"""}))
+    assert routes[("GET", "/feed")].auth == "unknown"
+    assert routes[("GET", "/maybe")].auth == "unknown"
+    assert routes[("GET", "/me")].auth == "required"
+
+
+def test_use_handler_is_resolved_by_type_or_left_unknown(tmp_path: Path) -> None:
+    routes = _by_key(_routes(tmp_path, {"Sources/App/Controllers.swift": """import Hummingbird
+struct Private {
+    func addRoutes(to group: RouterGroup<Context>) {
+        group.get("private", use: list)
+    }
+    func list(_ r: Request, context: Context) async throws -> String {
+        let user = try context.requireIdentity()
+        return user.name
+    }
+}
+struct Public {
+    func addRoutes(to group: RouterGroup<Context>) {
+        group.get("public", use: self.list)
+        group.get("other", use: Private.list)
+    }
+    func list(_ r: Request, context: Context) async throws -> String { "ok" }
+}
+func top(_ router: Router<Context>) {
+    router.get("ambiguous", use: list)
+}
+"""}))
+    by_tail = {path.rsplit("/", 1)[-1]: r for (_, path), r in routes.items()}
+    assert by_tail["public"].auth == "unknown"     # its own `list`, not Private's
+    assert by_tail["private"].auth == "required"
+    assert by_tail["other"].auth == "required"     # `Private.list` names the type
+    assert by_tail["ambiguous"].auth == "unknown"  # no top-level `list`: not guessed
+
+
+def test_unseen_or_disagreeing_mounts_leave_the_prefix_unknown(tmp_path: Path) -> None:
+    controller = """import Vapor
+struct TodoController: RouteCollection {
+    func boot(routes: RoutesBuilder) throws {
+        routes.get("todos", use: index)
+    }
+}
+"""
+    guarded_and_variable = """import Vapor
+func routes(_ app: Application) throws {
+    let protected = app.grouped(User.authenticator(), User.guardMiddleware())
+    try protected.register(collection: TodoController())
+    let open = TodoController()
+    try app.register(collection: open)
+}
+"""
+    routes = _routes(tmp_path / "a", {"Sources/App/Todo.swift": controller, "Sources/App/routes.swift": guarded_and_variable})
+    assert [(r.path, r.auth) for r in routes] == [("/$(TodoController)/todos", "unknown")]
+
+    opaque = guarded_and_variable.replace("try app.register(collection: open)", "try app.register(collection: controllers[0])")
+    routes = _routes(tmp_path / "b", {"Sources/App/Todo.swift": controller, "Sources/App/routes.swift": opaque})
+    assert [(r.path, r.auth) for r in routes] == [("/$(TodoController)/todos", "unknown")]
+
+    many = "import Vapor\nfunc routes(_ app: Application) throws {\n" + "    try app.grouped(User.guardMiddleware()).register(collection: TodoController())\n" * 17 + "}\n"
+    routes = _routes(tmp_path / "c", {"Sources/App/Todo.swift": controller, "Sources/App/routes.swift": many})
+    assert [(r.path, r.auth) for r in routes] == [("/$(TodoController)/todos", "unknown")]
+
+    one = "import Vapor\nfunc routes(_ app: Application) throws {\n    try app.grouped(User.guardMiddleware()).register(collection: TodoController())\n}\n"
+    routes = _routes(tmp_path / "d", {"Sources/App/Todo.swift": controller, "Sources/App/routes.swift": one})
+    assert [(r.path, r.auth) for r in routes] == [("/todos", "required")]
+
+
+def test_conditional_middleware_does_not_make_routes_required(tmp_path: Path) -> None:
+    routes = _by_key(_routes(tmp_path, {"Sources/App/App.swift": """import Hummingbird
+func build(_ router: Router<Context>, env: Env) {
+    if env.isProduction {
+        router.add(middleware: IsAuthenticatedMiddleware())
+    }
+    router.get("/a") { _, _ in "a" }
+}
+func build2(_ router: Router<Context>) {
+    #if AUTH
+    router.add(middleware: IsAuthenticatedMiddleware())
+    #endif
+    router.get("/b") { _, _ in "b" }
+}
+func build3(_ router: Router<Context>) {
+    router.add(middleware: IsAuthenticatedMiddleware())
+    router.get("/me") { _, _ in "c" }
+}
+"""}))
+    assert routes[("GET", "/a")].auth == "unknown"
+    assert routes[("GET", "/b")].auth == "unknown"
+    # A Router<Context> parameter is the root router, also in a top-level function.
+    assert routes[("GET", "/me")].auth == "required"
+
+
+# ---------- Review fixes: hostile input stays fast ----------
+
+import time  # noqa: E402
+
+
+def _timed(files: dict[str, str]) -> float:
+    start = time.perf_counter()
+    extract_repo_routes(list(files.items()))
+    return time.perf_counter() - start
+
+
+def test_closure_parameter_scan_is_linear() -> None:
+    body = 'import Vapor\nfunc r(_ app: Application) {\n' + ('app.group("a") {' + " " * 4000 + "x" + " " * 4000 + "y\n}\n") * 20 + "}\n"
+    assert _timed({"a.swift": body}) < 2.0
+
+
+def test_shared_handler_is_scanned_once() -> None:
+    handler = "    func h(_ req: Request) throws -> String {\n" + "        let x = 1 // auth.require\n" * 3000 + "        return \"\"\n    }\n"
+    routes = "".join(f'        routes.get("r{i}", use: h)\n' for i in range(1500))
+    text = f"import Vapor\nstruct C: RouteCollection {{\n    func boot(routes: RoutesBuilder) throws {{\n{routes}    }}\n{handler}}}\n"
+    assert _timed({"c.swift": text}) < 3.0
+
+
+def test_binding_expression_is_measured_once() -> None:
+    chain = 'let api = app.grouped("a")' + "".join(f'\n    .grouped("p{i}")' for i in range(2000))
+    routes = "".join(f'    api.get("r{i}", use: h)\n' for i in range(1500))
+    text = f"import Vapor\nfunc r(_ app: Application) {{\n    {chain}\n{routes}}}\n"
+    assert _timed({"b.swift": text}) < 3.0
+
+
+def test_many_functions_and_mutations_stay_fast() -> None:
+    funcs = "".join(
+        f"func f{i}(_ router: Router<Context>) {{\n    router.add(middleware: M{i}())\n    router.get(\"/r{i}\") {{ _, _ in \"\" }}\n}}\n"
+        for i in range(3000)
+    )
+    assert _timed({"m.swift": "import Hummingbird\n" + funcs}) < 3.0

@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Vapor 4 and Hummingbird 1.x/2.x route extraction (mlaify/AttackMap#187): verb calls on routers, `grouped`/`group` prefixes (closures, bindings, chains), `RouteCollection` and controller mounts, and computed paths kept as `$(expr)`. Routes carry `auth`/`guards`/`guard_evidence` (mlaify/AttackMap#256): `required` from Vapor guard/redirect middleware, Hummingbird `IsAuthenticatedMiddleware` / authorization-policy middleware, or a handler that requires the caller's identity; authenticators alone stay `unknown`. Test targets are skipped.
+- Vapor 4 and Hummingbird 1.x/2.x route extraction (mlaify/AttackMap#187): verb calls on routers, `grouped`/`group` prefixes (closures, bindings, chains), `RouteCollection` and controller mounts, and computed paths kept as `$(expr)`. Routes carry `auth`/`guards`/`guard_evidence` (mlaify/AttackMap#256): `required` from Vapor guard/redirect middleware, Hummingbird `IsAuthenticatedMiddleware` / authorization-policy middleware, or a handler that requires the caller's identity; authenticators alone stay `unknown`; `try?` identity checks, middleware added under `if`/`#if`, ambiguous `use:` handlers and unresolvable mounts never make a route `required`. Test targets are skipped.
 - CocoaPods SBOM: `Podfile.lock` pods are inventoried as `cocoapods` dependencies, direct when the Podfile lists them (#1).
 
 ### Changed

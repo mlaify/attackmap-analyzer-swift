@@ -27,7 +27,14 @@ what the source verifiably says is declared:
   only identifies a caller who sent credentials, so the route stays
   ``unknown``.
 - Hummingbird ``add(middleware:)`` / ``addMiddleware { }`` apply to routes
-  added after them on that router or group, in source order.
+  added after them on that router or group, in source order. Middleware added
+  under ``if`` / ``#if`` (or in a closure other than a ``group { }``) may not
+  run, so it never makes a route ``required``. ``try?`` around an identity
+  check swallows the rejection and doesn't count either.
+- A ``use:`` handler is resolved in the type that registers it (or the type
+  named, ``use: Controller.show``); an ambiguous name leaves auth unknown. A
+  mount whose type can't be resolved (``register(collection: items[0])``), or
+  more than 16 mounts, leaves every mount in that package unknown.
 
 Linear per file: brackets are matched once (``swiftsrc.parse``), receiver
 chains are bounded, and router resolution is memoized with a depth limit.
@@ -35,6 +42,7 @@ chains are bounded, and router resolution is memoized with a depth limit.
 
 from __future__ import annotations
 
+import bisect
 import posixpath
 import re
 from dataclasses import dataclass, field
@@ -63,7 +71,10 @@ _PARAM_ROUTER_TYPE = re.compile(
 )
 _FUNC = re.compile(r"\bfunc[ \t]+([A-Za-z_]\w*)[ \t]*(?:<[^>\n]{0,200}>)?[ \t]*\(")
 _TYPE_DECL = re.compile(r"\b(?:struct|class|extension|enum|actor)[ \t]+([A-Za-z_][\w.]*)")
-_CLOSURE_PARAM = re.compile(r"\{\s*(?:\[[^\]\n]{0,80}\]\s*)?\(?\s*([A-Za-z_]\w*)\s*(?:,[^)\n]{0,80})?\)?\s+in\b")
+# `{ r in`, `{ [weak self] (r) in`, `{ r, _ in`: parsed from a bounded window
+# after the brace (see `_closure_param`), so hostile whitespace stays linear.
+_CLOSURE_HEAD = re.compile(r"(?:\[[^\]\n]{0,80}\][ \t]*)?\(?[ \t]*([A-Za-z_]\w{0,60})[ \t]*(?:,[^)\n{]{0,80})?\)?")
+_CLOSURE_WINDOW = 240
 _REGISTER = re.compile(r"\.[ \t]*register[ \t]*\([ \t]*collection[ \t]*:")
 _ADD_ROUTES = re.compile(r"\.[ \t]*addRoutes[ \t]*\(")
 _MUTATION = re.compile(r"\.[ \t]*(?:add[ \t]*\([ \t]*middleware[ \t]*:|addMiddleware[ \t]*\{)")
@@ -84,6 +95,7 @@ _HANDLER_GUARD = re.compile(
 )
 
 _MAX_CHAIN = 24
+_MAX_NESTING_WALK = 256
 _MAX_DEPTH = 8
 _MAX_MOUNTS = 16
 _PATH_EXPR_MAX = 60
@@ -102,6 +114,7 @@ _HANDLER_ROLE = re.compile(
     r"\.(?:roles?|permissions?)[ \t]*\.[ \t]*contains[ \t]*\("
     r"|\bisAdmin\b|\bhasRole[ \t]*\(|\bhasPermission[ \t]*\(|\bRolePolicy[ \t]*\(|\bPermissionPolicy[ \t]*\("
 )
+_PP_DIRECTIVE = re.compile(r"^[ \t]*#(if|endif)\b", re.MULTILINE)
 _MIDDLEWARE_NAME = re.compile(r"(?i)middleware|auth|guard|session|token|jwt|cors|limit|log|error|file")
 
 
@@ -110,6 +123,9 @@ class Guard:
     name: str
     enforcing: bool  # False for an authenticator that only identifies the caller
     evidence: str
+    # Added under `if` / `#if` / a non-group closure: it may not apply, so it
+    # never makes a route `required` on its own.
+    conditional: bool = False
 
 
 @dataclass(frozen=True)
@@ -237,6 +253,65 @@ def _method(value: str) -> str | None:
 
 # ---------- Per-file model ----------
 
+class _SpanIndex:
+    """Innermost-enclosing lookup over properly nested (open, close, payload)
+    spans: a bisect plus a bounded walk up parent links."""
+
+    def __init__(self, spans) -> None:
+        self.spans = sorted(spans, key=lambda s: (s[0], -s[1]))
+        self.opens = [s[0] for s in self.spans]
+        self.parent: list[int] = []
+        stack: list[int] = []
+        for i, (open_, _close, *_rest) in enumerate(self.spans):
+            while stack and self.spans[stack[-1]][1] < open_:
+                stack.pop()
+            self.parent.append(stack[-1] if stack else -1)
+            stack.append(i)
+
+    def innermost(self, offset: int):
+        i = bisect.bisect_left(self.opens, offset) - 1
+        for _ in range(_MAX_NESTING_WALK):
+            if i < 0:
+                return None
+            span = self.spans[i]
+            if span[0] < offset < span[1]:
+                return span
+            i = self.parent[i]
+        return None
+
+    def containing(self, offset: int):
+        """Enclosing spans, innermost first (bounded)."""
+        span = self.innermost(offset)
+        if span is None:
+            return
+        i = bisect.bisect_left(self.opens, span[0])
+        while i < len(self.spans) and self.spans[i] is not span:
+            i += 1
+        for _ in range(_MAX_NESTING_WALK):
+            if i < 0:
+                return
+            if self.spans[i][0] < offset < self.spans[i][1]:
+                yield self.spans[i]
+            i = self.parent[i]
+
+
+def _closure_param(text: str, brace: int, close: int) -> str:
+    """The parameter of a `{ r in ...}` closure, else `$0`."""
+    end = min(close, brace + _CLOSURE_WINDOW)
+    pos = brace + 1
+    while pos < end and text[pos].isspace():
+        pos += 1
+    m = _CLOSURE_HEAD.match(text, pos, end)
+    if m is None:
+        return "$0"
+    k = m.end()
+    while k < end and text[k] in " \t":
+        k += 1
+    if not text.startswith("in", k) or k + 2 > end or (k + 2 < len(text) and (text[k + 2].isalnum() or text[k + 2] == "_")):
+        return "$0"
+    return m.group(1)
+
+
 @dataclass
 class _Closure:
     open: int
@@ -260,6 +335,16 @@ class SwiftFile:
         self.functions: dict[str, list[tuple[int, int]]] = {}
         self.types: list[tuple[int, int, str]] = []
         self.mutations: dict[str, list[tuple[int, Guard]]] = {}
+        self.handler_cache: dict[tuple[int, int], tuple[tuple[str, str] | None, str | None]] = {}
+        self.expression_end_cache: dict[int, int] = {}
+        self.scope_cache: dict[tuple[str, int], Scope | None] = {}
+        self.group_bodies: set[tuple[int, int]] = set()
+        self.pp_if: list[int] = []
+        self.pp_endif: list[int] = []
+        self.function_index = _SpanIndex([])
+        self.type_index = _SpanIndex([])
+        self.block_index = _SpanIndex([])
+        self.closure_index = _SpanIndex([])
         self.src: Source = swiftsrc.parse(text) if self.is_server else Source(text)
         if self.is_server:
             self._index()
@@ -310,9 +395,15 @@ class SwiftFile:
             body_close = src.close_of(brace)
             if body_close < 0:
                 continue
-            pm = _CLOSURE_PARAM.match(text, brace)
-            param = pm.group(1) if pm else "$0"
+            param = _closure_param(text, brace, body_close)
             self.closures.append(_Closure(brace, body_close, param, m.start(), (paren, close)))
+            self.group_bodies.add((brace, body_close))
+        self.function_index = _SpanIndex([(o, c, n) for n, spans in self.functions.items() for o, c in spans])
+        self.type_index = _SpanIndex(self.types)
+        self.block_index = _SpanIndex([(o, c, "") for o, c in src.pairs.items() if text[o] == "{"])
+        self.closure_index = _SpanIndex([(c.open, c.close, c) for c in self.closures])
+        for m in _PP_DIRECTIVE.finditer(text):
+            (self.pp_endif if m.group(1) == "endif" else self.pp_if).append(m.start())
         for m in _MUTATION.finditer(text):
             if not self.code(m.start()):
                 continue
@@ -325,7 +416,10 @@ class SwiftFile:
                 continue
             if any(s.closure is not None and s.args is None and s.name != "addMiddleware" for s in chain[1:]):
                 continue
+            conditional = self.is_conditional(m.start())
             for guard in self._mutation_guard(m.start(), start) or ():
+                if conditional:
+                    guard = Guard(guard.name, guard.enforcing, guard.evidence, conditional=True)
                 self.mutations.setdefault(chain[0].name, []).append((m.start(), guard))
 
     def _mutation_guard(self, dot: int, start: int) -> tuple[Guard, ...] | None:
@@ -347,31 +441,43 @@ class SwiftFile:
         return (_guard_for(value, clip(text[start:close + 1])),)
 
     def enclosing_type(self, offset: int) -> tuple[int, int, str] | None:
-        best: tuple[int, int, str] | None = None
-        for open_, close, name in self.types:
-            if open_ < offset < close and (best is None or open_ > best[0]):
-                best = (open_, close, name)
-        return best
+        found = self.type_index.innermost(offset)
+        return found  # type: ignore[return-value]
 
     def enclosing_function(self, offset: int) -> tuple[int, int] | None:
-        best: tuple[int, int] | None = None
-        for spans in self.functions.values():
-            for open_, close in spans:
-                if open_ < offset < close and (best is None or open_ > best[0]):
-                    best = (open_, close)
-        return best
+        found = self.function_index.innermost(offset)
+        return (found[0], found[1]) if found is not None else None
 
-    def function_body(self, name: str, near: int) -> tuple[int, int] | None:
-        """Body of ``func name`` in the type enclosing ``near`` (else the first)."""
+    def is_conditional(self, offset: int) -> bool:
+        """True when ``offset`` sits in a block that may not run: inside an
+        `if`/`for`/other closure body rather than directly in a function or a
+        `group { }` closure, or between `#if` and `#endif`."""
+        block = self.block_index.innermost(offset)
+        function = self.function_index.innermost(offset)
+        if block is not None and (function is None or block[0] != function[0]):
+            if (block[0], block[1]) not in self.group_bodies:
+                return True
+        start = function[0] if function is not None else 0
+        opened = bisect.bisect_left(self.pp_if, offset) - bisect.bisect_left(self.pp_if, start)
+        closed = bisect.bisect_left(self.pp_endif, offset) - bisect.bisect_left(self.pp_endif, start)
+        return opened > closed
+
+    def function_body(self, name: str, near: int, type_name: str | None = None) -> tuple[int, int] | None:
+        """Body of ``func name`` declared in ``type_name`` (default: the type
+        enclosing ``near``, or top level), across its extensions in this file.
+        None unless exactly one candidate: an ambiguous handler stays unseen."""
         spans = self.functions.get(name)
         if not spans:
             return None
-        owner = self.enclosing_type(near)
-        if owner is not None:
-            for span in spans:
-                if owner[0] < span[0] < owner[1]:
-                    return span
-        return spans[0]
+        if type_name is None:
+            owner = self.enclosing_type(near)
+            type_name = owner[2] if owner is not None else None
+        candidates = []
+        for span in spans:
+            declared = self.enclosing_type(span[0])
+            if (declared[2] if declared is not None else None) == type_name:
+                candidates.append(span)
+        return candidates[0] if len(candidates) == 1 else None
 
 
 def _next_code_char(text: str, pos: int, limit: int = 200) -> int:
@@ -495,6 +601,8 @@ class RouteResolver:
         self._mounts: dict[tuple[str, str], list[tuple[str, SwiftFile, object, tuple[str, ...]]]] | None = None
         self._type_scope: dict[tuple[str, str], Scope | None] = {}
         self._resolving: set[tuple[str, str]] = set()
+        # Packages with a mount whose type can't be resolved.
+        self.unresolved_packages: set[str] = set()
 
     def mounts(self) -> dict[tuple[str, str], list[tuple[str, SwiftFile, object, tuple[str, ...]]]]:
         if self._mounts is not None:
@@ -507,11 +615,19 @@ class RouteResolver:
                     continue
                 args = self._call_args(f, m.start())
                 if not args:
+                    self.unresolved_packages.add(f.package)
                     continue
-                _, value = arg_label(text[args[0][0]:args[0][1]])
-                ctor = _CTOR.match(value)
-                if ctor is not None:
-                    mounts.setdefault((f.package, ctor.group(1)), []).append(("receiver", f, m.start(), ()))
+                start, end = args[0]
+                _, value = arg_label(text[start:end])
+                start = end - len(value) - (len(text[start:end]) - len(text[start:end].rstrip()))
+                chain = parse_chain(f, start, end)
+                type_name = self._type_of(f, chain[0], m.start()) if chain and len(chain) == 1 else None
+                if type_name is None:
+                    # `register(collection: controllers[i])`: some type is mounted
+                    # somewhere we can't see, so no mount in this package is certain.
+                    self.unresolved_packages.add(f.package)
+                    continue
+                mounts.setdefault((f.package, type_name), []).append(("receiver", f, m.start(), ()))
             for m in _ADD_ROUTES.finditer(text):
                 if not f.code(m.start()):
                     continue
@@ -522,12 +638,15 @@ class RouteResolver:
                 if label == "to":
                     # Controller(...).addRoutes(to: router.group("x"))
                     type_name = self._controller_type(f, m.start())
-                    if type_name is not None:
-                        mounts.setdefault((f.package, type_name), []).append(("expr", f, args[0], ()))
+                    if type_name is None:
+                        self.unresolved_packages.add(f.package)
+                        continue
+                    mounts.setdefault((f.package, type_name), []).append(("expr", f, args[0], ()))
                 elif label is None:
                     # router.addRoutes(Controller(...).endpoints, atPath: "/x")
                     type_name = self._collection_type(f, args[0])
                     if type_name is None:
+                        self.unresolved_packages.add(f.package)
                         continue
                     prefix: tuple[str, ...] = ()
                     for start, end in args[1:]:
@@ -587,10 +706,13 @@ class RouteResolver:
     def _resolve_type(self, key: tuple[str, str], depth: int) -> Scope | None:
         if key in self._resolving or depth > _MAX_DEPTH:
             return None
+        sites = self.mounts().get(key, [])
+        if key[0] in self.unresolved_packages or len(sites) > _MAX_MOUNTS:
+            return None  # a mount we can't see (or too many to check) may differ
         self._resolving.add(key)
         try:
             scopes: list[Scope | None] = []
-            for kind, f, where, prefix in self.mounts().get(key, [])[:_MAX_MOUNTS]:
+            for kind, f, where, prefix in sites:
                 if kind == "receiver":
                     assert isinstance(where, int)
                     _, chain = receiver_chain(f, where)
@@ -617,29 +739,38 @@ class RouteResolver:
             return None
         # Innermost group closure binding this name ($0 or its parameter).
         best: _Closure | None = None
-        for c in f.closures:
-            if c.open < offset < c.close and c.param == name and (best is None or c.open > best.open):
-                best = c
+        for span in f.closure_index.containing(offset):
+            if span[2].param == name:
+                best = span[2]
+                break
         if best is not None:
-            start, chain = receiver_chain(f, best.call_dot)
-            parent = self.eval_chain(f, chain, best.call_dot, depth + 1) if chain else None
-            if parent is None:
+            key = ("closure", best.open)
+            if key not in f.scope_cache:
+                f.scope_cache[key] = None  # breaks self-reference cycles
+                start, chain = receiver_chain(f, best.call_dot)
+                parent = self.eval_chain(f, chain, best.call_dot, depth + 1) if chain else None
+                evidence = clip(f.text[start:best.args[1] + 1])
+                f.scope_cache[key] = _apply_args(f, parent, best.args, evidence) if parent is not None else None
+            scope = f.scope_cache[key]
+            if scope is None:
                 return None
-            evidence = clip(f.text[start:best.args[1] + 1])
-            return self._with_mutations(f, name, offset, _apply_args(f, parent, best.args, evidence), best.open)
+            return self._with_mutations(f, name, offset, scope, best.open)
         # A local binding: `let api = app.grouped("api")`.
         binding = _nearest(f.bindings.get(name, ()), offset)
         if binding is not None and _same_function(f, binding, offset):
-            chain = parse_chain(f, binding, _expression_end(f, binding))
-            if chain is not None:
-                scope = self.eval_chain(f, chain, binding, depth + 1)
-                if scope is not None:
-                    return self._with_mutations(f, name, offset, scope, binding)
+            key = ("binding", binding)
+            if key not in f.scope_cache:
+                f.scope_cache[key] = None
+                chain = parse_chain(f, binding, _expression_end(f, binding))
+                f.scope_cache[key] = self.eval_chain(f, chain, binding, depth + 1) if chain is not None else None
+            scope = f.scope_cache[key]
+            if scope is not None:
+                return self._with_mutations(f, name, offset, scope, binding)
         # A parameter typed as a router.
         for open_, close, type_name in f.params.get(name, ()):
             if open_ < offset < close:
-                if type_name in ("Application", "HBApplication"):
-                    scope = Scope(())
+                if type_name in ("Application", "HBApplication", "Router", "HBRouterBuilder"):
+                    scope = Scope(())  # the root: only a RouterGroup / RoutesBuilder can carry a prefix
                 else:
                     scope = self.type_scope(f, offset, depth + 1)
                 return self._with_mutations(f, name, offset, scope, open_)
@@ -719,11 +850,9 @@ def _apply_args(f: SwiftFile, scope: Scope, span: tuple[int, int], evidence: str
 
 
 def _nearest(offsets, before: int) -> int | None:
-    best = None
-    for o in offsets:
-        if o < before and (best is None or o > best):
-            best = o
-    return best
+    """The last offset before ``before`` (``offsets`` are ascending)."""
+    i = bisect.bisect_left(offsets, before)
+    return offsets[i - 1] if i > 0 else None
 
 
 def _same_function(f: SwiftFile, a: int, b: int) -> bool:
@@ -732,7 +861,15 @@ def _same_function(f: SwiftFile, a: int, b: int) -> bool:
 
 def _expression_end(f: SwiftFile, start: int) -> int:
     """End of the expression starting at ``start``: its line, extended over
-    brackets opened on it and over following lines that start with `.`."""
+    brackets opened on it and over following lines that start with `.`
+    (cached per start offset)."""
+    cached = f.expression_end_cache.get(start)
+    if cached is None:
+        cached = f.expression_end_cache[start] = _compute_expression_end(f, start)
+    return cached
+
+
+def _compute_expression_end(f: SwiftFile, start: int) -> int:
     text, src = f.text, f.src
     n = len(text)
     pos = start
@@ -761,13 +898,12 @@ def _expression_end(f: SwiftFile, start: int) -> int:
     return pos
 
 
+_OPEN_BRACKET = re.compile(r"[(\[{]")
+
+
 def _first_open(text: str, start: int, end: int) -> int:
-    best = -1
-    for ch in "([{":
-        i = text.find(ch, start, end)
-        if i >= 0 and (best < 0 or i < best):
-            best = i
-    return best
+    m = _OPEN_BRACKET.search(text, start, end)
+    return m.start() if m else -1
 
 
 # ---------- Route extraction ----------
@@ -831,34 +967,63 @@ def _handler_span(f: SwiftFile, dot: int, after: int, use: str | None) -> tuple[
             if end > 0:
                 return (brace, end)
         return None
-    name = use.rsplit(".", 1)[-1].strip()
-    if name.isidentifier():
-        return f.function_body(name, dot)
-    return None
+    qualifier, _, name = use.strip().rpartition(".")
+    if not name.isidentifier():
+        return None
+    # `use: Controller.show` names the type; `self.x` / `x` / `Self.x` mean the enclosing one.
+    owner = qualifier if qualifier[:1].isupper() and qualifier.isidentifier() and qualifier != "Self" else None
+    return f.function_body(name, dot, owner)
+
+
+# `try? req.auth.require(...)` / `(try? context.requireIdentity())` swallow the
+# error: the handler carries on for anonymous callers.
+_TRY_OPTIONAL_TAIL = re.compile(r"try\?[ \t]*(?:[\w$]{1,60}[ \t]*\.[ \t]*){0,6}$")
+
+
+def _handler_checks(f: SwiftFile, handler: tuple[int, int]) -> tuple[tuple[str, str] | None, str | None]:
+    """(identity guard name + line, role-guard line) in a handler body,
+    computed once per handler."""
+    cached = f.handler_cache.get(handler)
+    if cached is not None:
+        return cached
+    text = f.text
+    identity: tuple[str, str] | None = None
+    for m in _HANDLER_GUARD.finditer(text, handler[0], handler[1]):
+        if not f.code(m.start()):
+            continue
+        if _TRY_OPTIONAL_TAIL.search(text, max(handler[0], m.start() - 120), m.start()):
+            continue
+        identity = (_handler_guard_name(m.group(0)), clip(_line_at(text, m.start())))
+        break
+    role: str | None = None
+    for m in _HANDLER_ROLE.finditer(text, handler[0], handler[1]):
+        line = _line_at(text, m.start()).strip()
+        if f.code(m.start()) and line.startswith("guard "):
+            role = clip(line, 80)
+            break
+    f.handler_cache[handler] = (identity, role)
+    return identity, role
 
 
 def _resolve_auth(f: SwiftFile, hit: RouteHit, scope: Scope, handler: tuple[int, int] | None) -> None:
-    enforcing = [g for g in scope.guards if g.enforcing]
+    enforcing = [g for g in scope.guards if g.enforcing and not g.conditional]
+    identity, role = _handler_checks(f, handler) if handler is not None else (None, None)
     if enforcing:
         hit.auth = REQUIRED
-        hit.guards = list(dict.fromkeys(g.name for g in scope.guards if g.enforcing or _AUTHENTICATOR.search(g.name)))
+        hit.guards = list(dict.fromkeys(
+            g.name for g in scope.guards
+            if not g.conditional and (g.enforcing or _AUTHENTICATOR.search(g.name))
+        ))
         hit.evidence = clip("; ".join(dict.fromkeys(g.evidence for g in enforcing)))
-    elif handler is not None:
-        for m in _HANDLER_GUARD.finditer(f.text, handler[0], handler[1]):
-            if f.code(m.start()):
-                hit.auth = REQUIRED
-                hit.guards = list(dict.fromkeys(
-                    [g.name for g in scope.guards if _AUTHENTICATOR.search(g.name)] + [_handler_guard_name(m.group(0))]
-                ))
-                hit.evidence = clip(_line_at(f.text, m.start()))
-                break
-    if hit.auth == REQUIRED and handler is not None:
+    elif identity is not None:
+        hit.auth = REQUIRED
+        hit.guards = list(dict.fromkeys(
+            [g.name for g in scope.guards if not g.conditional and _AUTHENTICATOR.search(g.name)] + [identity[0]]
+        ))
+        hit.evidence = identity[1]
+    if hit.auth == REQUIRED and role is not None:
         # A `guard` on a role or permission in the handler is a guard too.
-        for m in _HANDLER_ROLE.finditer(f.text, handler[0], handler[1]):
-            line = _line_at(f.text, m.start()).strip()
-            if f.code(m.start()) and line.startswith("guard "):
-                hit.guards.append(clip(line, 80))
-                break
+        hit.guards.append(role)
 
 
 def _line_at(text: str, offset: int) -> str:
