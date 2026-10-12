@@ -130,11 +130,12 @@ def test_objc_surface_and_native_weaknesses(tmp_path: Path) -> None:
     assert _lines(result, "apple_dynamic_dispatch") == [(29, "medium"), (32, "medium")]
     assert _lines(result, "format_string") == [(36, "medium"), (41, "medium"), (44, "medium")]
     assert _lines(result, "native_command_exec") == [(50, "medium"), (52, "medium")]
+    # A mach service in the same file: high.
     assert _lines(result, "apple_xpc_unvalidated_peer") == [(59, "high")]
     assert all(w.confidence == "medium" and w.source_kind is None for w in result.code_weaknesses)
     hints = {(h.hint, h.line) for h in result.entrypoint_hints}
     assert ("url_scheme_handler (opens URLs from other apps)", 6) in hints
-    assert ("xpc_service (NSXPCListener)", 72) in hints
+    assert ("xpc_service: mach service (NSXPCListener(machServiceName:))", 72) in hints
     scheme = [i for i in result.app_surface_issues if i.kind == "apple_custom_url_scheme"]
     assert [i.evidence_text for i in scheme] == ["CFBundleURLSchemes: legacyapp://"]
     assert result.languages == ["objective-c"] and result.files_scanned == 1
@@ -200,3 +201,24 @@ def test_garbage_never_raises(tmp_path: Path) -> None:
         _write(tmp_path, f"c/C{cut}.m", "#import <X.h>\n" + OBJC[:cut])
     _write(tmp_path, "n/Noise.m", "#import <X.h>\n" + "".join(rng.choice(alphabet) for _ in range(20000)))
     ObjCAnalyzer().analyze(tmp_path)  # must not raise
+
+
+def test_objc_bundled_xpc_service_is_low_and_helper_checks_count(tmp_path: Path) -> None:
+    template = """#import <Foundation/Foundation.h>
+@implementation ServiceDelegate
+- (BOOL)listener:(NSXPCListener *)listener shouldAcceptNewConnection:(NSXPCConnection *)newConnection {
+    newConnection.exportedObject = [MyService new];
+    [newConnection resume];
+    return YES;
+}
+@end
+int main(void) {
+    NSXPCListener *listener = [NSXPCListener serviceListener];
+    [listener resume];
+}
+"""
+    result = _analyze(tmp_path / "bundled", {"MyService/main.m": template})
+    assert _lines(result, "apple_xpc_unvalidated_peer") == [(3, "low")]
+    checked = template.replace("    [newConnection resume];", "    if (![self isTrustedPeer:newConnection]) return NO;\n    [newConnection resume];")
+    result = _analyze(tmp_path / "checked", {"MyService/main.m": checked})
+    assert _lines(result, "apple_xpc_unvalidated_peer") == []

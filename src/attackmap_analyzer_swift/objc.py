@@ -129,9 +129,11 @@ _UNIVERSAL_LINK_DEF = re.compile(
     r"^[ \t]*-[ \t]*\([ \t]*BOOL[ \t]*\)[ \t]*application[ \t]*:[^{;]{0,300}?\bcontinueUserActivity[ \t]*:",
     re.MULTILINE,
 )
-_XPC_LISTENER = re.compile(r"\bNSXPCListener[ \t]+alloc[ \t]*\][ \t]*initWithMachServiceName[ \t]*:|\[[ \t]*NSXPCListener[ \t]+serviceListener[ \t]*\]")
+_XPC_MACH_LISTENER = re.compile(r"\bNSXPCListener[ \t]+alloc[ \t]*\][ \t]*initWithMachServiceName[ \t]*:")
+_XPC_LOCAL_LISTENER = re.compile(r"\[[ \t]*NSXPCListener[ \t]+(serviceListener|anonymousListener)[ \t]*\]")
 _XPC_ACCEPT = re.compile(
-    r"^[ \t]*-[ \t]*\([ \t]*BOOL[ \t]*\)[ \t]*listener[ \t]*:[^{;]{0,200}?\bshouldAcceptNewConnection[ \t]*:[^{;]{0,200}\{",
+    r"^[ \t]*-[ \t]*\([ \t]*BOOL[ \t]*\)[ \t]*listener[ \t]*:[^{;]{0,200}?\bshouldAcceptNewConnection[ \t]*:"
+    r"[ \t]*\([^)\n]{0,80}\)[ \t]*(\w{1,60})[^{;]{0,200}\{",
     re.MULTILINE,
 )
 _RETURN_YES = re.compile(r"\breturn[ \t]+(?:YES|true)\b")
@@ -318,11 +320,18 @@ def analyze_objc_source(rel_path: str, text: str, result: ScanResult, handlers: 
                 hint="universal_link_handler (continueUserActivity)", file=rel_path,
                 line=line_of(text, m.start()), evidence_text=snippet(m.start()), confidence=0.8,
             ))
-    for m in _XPC_LISTENER.finditer(text):
+    for m in _XPC_MACH_LISTENER.finditer(text):
         if code(m.start()):
             result.entrypoint_hints.append(EntrypointHint(
-                hint="xpc_service (NSXPCListener)", file=rel_path, line=line_of(text, m.start()),
+                hint=apple_surface.XPC_MACH_HINT, file=rel_path, line=line_of(text, m.start()),
                 evidence_text=snippet(m.start()), confidence=0.9,
+            ))
+    for m in _XPC_LOCAL_LISTENER.finditer(text):
+        if code(m.start()):
+            kind = "bundled XPC service" if m.group(1) == "serviceListener" else "anonymous listener"
+            result.entrypoint_hints.append(EntrypointHint(
+                hint=f"xpc_service: {kind} ([NSXPCListener {m.group(1)}])", file=rel_path,
+                line=line_of(text, m.start()), evidence_text=snippet(m.start()), confidence=0.9,
             ))
     for m in _XPC_ACCEPT.finditer(text):
         brace = m.end() - 1
@@ -330,7 +339,7 @@ def analyze_objc_source(rel_path: str, text: str, result: ScanResult, handlers: 
         if close < 0 or not code(brace):
             continue
         body = text[brace:close]
-        if _RETURN_YES.search(body) and not apple_surface._XPC_PEER_CHECK.search(body):
+        if _RETURN_YES.search(body) and not apple_surface.xpc_peer_checked(body, m.group(1)):
             issue("apple_xpc_unvalidated_peer", m.start(), "high",
                   "listener:shouldAcceptNewConnection: returns YES without checking the peer's audit token or code signature")
 
@@ -480,6 +489,7 @@ class ObjCAnalyzer:
             result.files_scanned += 1
             analyze_objc_source(rel_path, text, result, handlers)
         apple_surface.report_url_schemes(result, handlers)
+        apple_surface.finalize_xpc(result)
         if result.files_scanned:
             result.languages.append("objective-c")
         return result
