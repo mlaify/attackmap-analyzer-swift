@@ -35,6 +35,13 @@ class Source:
         i = bisect.bisect_right(self._starts, offset) - 1
         return i >= 0 and self.masked[i][0] <= offset < self.masked[i][1]
 
+    def masked_span(self, offset: int) -> tuple[int, int] | None:
+        """The string or comment span containing ``offset``, if any."""
+        i = bisect.bisect_right(self._starts, offset) - 1
+        if i >= 0 and self.masked[i][0] <= offset < self.masked[i][1]:
+            return self.masked[i]
+        return None
+
     def close_of(self, offset: int) -> int:
         """Offset of the bracket closing the one at ``offset``, or -1."""
         return self.pairs.get(offset, -1)

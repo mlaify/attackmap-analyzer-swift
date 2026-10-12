@@ -591,3 +591,28 @@ def test_many_same_named_handlers_stay_fast() -> None:
         for i in range(6000)
     )
     assert _timed({"c.swift": "import Hummingbird\n" + controllers}) < 4.0
+
+
+# ---------- Review round 3: the check must always run first ----------
+
+
+def test_identity_check_must_precede_every_exit(tmp_path: Path) -> None:
+    def handler(body: str) -> str:
+        return "    router.get(\"/x\") { request, context in\n" + body + "        return \"ok\"\n    }\n"
+
+    cases = {
+        "early-return-in-if": "        if flag { return \"public\" }\n        let u = try context.requireIdentity()\n",
+        "guard-return": "        guard strict else { return \"public\" }\n        let u = try context.requireIdentity()\n",
+        "plain-return": "        return \"public\"\n        let u = try context.requireIdentity()\n",
+        "earlier-try": "        let id = try context.parameters.require(\"id\")\n        let u = try context.requireIdentity()\n",
+        "pp-if": "        #if DEBUG\n        let u = try context.requireIdentity()\n        #endif\n",
+        "continued": "        let u = flag ? nil :\n            try context.requireIdentity()\n",
+        "continued-equals": "        let u =\n            try context.requireIdentity()\n",
+        "first": "        // the caller must be signed in.\n        let u = try context.requireIdentity()\n        if u.isAdmin { return \"admin\" }\n",
+        "401-guard-first": "        guard let u = context.identity else { throw HTTPError(.unauthorized) }\n        if flag { return \"x\" }\n",
+    }
+    for name, body in cases.items():
+        text = "import Hummingbird\nfunc build(_ router: Router<Context>) {\n" + handler(body) + "}\n"
+        (route,) = _routes(tmp_path / name, {"Sources/App/App.swift": text})
+        expected = "required" if name in ("first", "401-guard-first") else "unknown"
+        assert route.auth == expected, name

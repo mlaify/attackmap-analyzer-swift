@@ -29,8 +29,10 @@ what the source verifiably says is declared:
 - Hummingbird ``add(middleware:)`` / ``addMiddleware { }`` apply to routes
   added after them on that router or group, in source order. Middleware added
   under ``if`` / ``#if`` (or in a closure other than a ``group { }``) may not
-  run, so it never makes a route ``required``. ``try?`` around an identity
-  check swallows the rejection and doesn't count either.
+  run, so it never makes a route ``required``. A handler's identity check
+  counts only as a top-level statement (plain ``try``, not inside ``#if``,
+  not continued from the previous line) that comes before anything in the
+  handler that can ``return``, ``throw`` (incl. ``try``) or ``guard``.
 - A ``use:`` handler is resolved in the type that registers it (or the type
   named, ``use: Controller.show``); an ambiguous name leaves auth unknown. A
   mount whose type can't be resolved (``register(collection: items[0])``), or
@@ -1034,6 +1036,49 @@ def _top_level_statement(f: SwiftFile, handler: tuple[int, int], offset: int) ->
     return paren is None or paren[0] < handler[0]
 
 
+_EXIT_TOKEN = re.compile(r"\b(?:return|throw|try|guard|fallthrough)\b")
+# A line ending like this continues on the next one (`let u = flag ? nil :`).
+_CONTINUES = set("=+-*/%&|^!<>?:,.([{")
+
+
+def _enforced_check(f: SwiftFile, handler: tuple[int, int], m: re.Match[str], first_exit: int) -> tuple[str, str] | None:
+    """The identity check at ``m`` as (guard name, evidence line), when it
+    always runs before the handler can answer; else None."""
+    text = f.text
+    if not _top_level_statement(f, handler, m.start()):
+        return None
+    line = text.rfind("\n", handler[0], m.start()) + 1 or handler[0] + 1
+    statement = max(line, text.rfind(";", line, m.start()) + 1)
+    # The statement must really start on this line: not continued from the
+    # previous one (`let u = flag ? nil :` / `=` / `,` ...). Comments are skipped.
+    k = statement - 1
+    for _ in range(64):
+        while k > handler[0] and text[k].isspace():
+            k -= 1
+        span = f.src.masked_span(k) if k > handler[0] else None
+        if span is None or text[span[0]] == '"' or text[span[0]] == "#":
+            break
+        k = span[0] - 1
+    else:
+        return None
+    if k > handler[0] and (text[k] in _CONTINUES or f.src.in_masked(k) and text[k] != '"'):
+        return None
+    if m.group(0).startswith("guard"):
+        ok = not text[statement:m.start()].strip()  # the guard is the statement
+    else:
+        ok = _ENFORCED_CALL_PREFIX.fullmatch(text, statement, m.start()) is not None
+    if not ok:
+        return None  # `try?`, `if let ... = try? ...`, a condition, a line break after `try`
+    if first_exit < statement:
+        return None  # something can return or throw before the check
+    # Not between `#if` and `#endif` inside the handler.
+    opened = bisect.bisect_left(f.pp_if, m.start()) - bisect.bisect_left(f.pp_if, handler[0])
+    closed = bisect.bisect_left(f.pp_endif, m.start()) - bisect.bisect_left(f.pp_endif, handler[0])
+    if opened > closed:
+        return None
+    return (_handler_guard_name(m.group(0)), clip(_line_at(text, m.start())))
+
+
 def _handler_checks(f: SwiftFile, handler: tuple[int, int]) -> tuple[tuple[str, str] | None, str | None]:
     """(identity guard name + line, role-guard line) in a handler body,
     computed once per handler."""
@@ -1042,18 +1087,20 @@ def _handler_checks(f: SwiftFile, handler: tuple[int, int]) -> tuple[tuple[str, 
         return cached
     text = f.text
     identity: tuple[str, str] | None = None
+    # The first statement in the handler that can leave it (`return`, `throw`,
+    # `try`, `guard`), at any depth, must be the identity check itself: an
+    # earlier `if flag { return ... }` or `try` serves (or fails) the request
+    # before the check runs.
+    first_exit = -1
+    for e in _EXIT_TOKEN.finditer(text, handler[0] + 1, handler[1]):
+        if f.code(e.start()):
+            first_exit = e.start()
+            break
     for m in _HANDLER_GUARD.finditer(text, handler[0], handler[1]):
-        if not f.code(m.start()) or not _top_level_statement(f, handler, m.start()):
+        if not f.code(m.start()):
             continue
-        statement = max(text.rfind("\n", handler[0], m.start()), text.rfind(";", handler[0], m.start()), handler[0]) + 1
-        if m.group(0).startswith("guard"):
-            ok = not text[statement:m.start()].strip()  # the guard is the statement
-        else:
-            ok = _ENFORCED_CALL_PREFIX.fullmatch(text, statement, m.start()) is not None
-        if not ok:
-            continue  # `try?`, `if let ... = try? ...`, a condition, a line break after `try`
-        identity = (_handler_guard_name(m.group(0)), clip(_line_at(text, m.start())))
-        break
+        identity = _enforced_check(f, handler, m, first_exit)
+        break  # only the first check is considered; when in doubt, unknown
     role: str | None = None
     for m in _HANDLER_ROLE.finditer(text, handler[0], handler[1]):
         line = _line_at(text, m.start()).strip()
