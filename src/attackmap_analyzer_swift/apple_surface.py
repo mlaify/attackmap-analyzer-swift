@@ -638,23 +638,25 @@ def _swift_string_end(text: str) -> int:
 
 def _add_unique(result: ScanResult, issue: AppSurfaceIssue) -> None:
     for existing in result.app_surface_issues:
-        if (existing.kind, existing.file, existing.line) == (issue.kind, issue.file, issue.line):
+        if (existing.kind, existing.file, existing.line, existing.evidence_text) == (
+            issue.kind, issue.file, issue.line, issue.evidence_text
+        ):
             return
     result.app_surface_issues.append(issue)
 
 
 def report_url_schemes(result: ScanResult, handlers: list[Handler]) -> None:
     """One `apple_custom_url_scheme` issue per scheme declared in an
-    Info.plist, citing the handler(s) that open the URLs."""
-    where = ", ".join(f"{h.file}:{h.line}" for h in handlers[:3])
-    handled = f"; handled at {where}" if where else ""
+    Info.plist. The handlers that open the URLs are entry points of their own;
+    they aren't folded into the evidence, so the Swift and Objective-C
+    analyzers report the same issue and core's merge keeps one."""
     for hint in list(result.entrypoint_hints):
         if not hint.hint.startswith(_SCHEME_HINT):
             continue
         scheme = hint.hint[len(_SCHEME_HINT):]
         _add_unique(result, AppSurfaceIssue(
             kind="apple_custom_url_scheme", file=hint.file, line=hint.line, severity="low",
-            evidence_text=clip(f"CFBundleURLSchemes: {scheme}{handled}", _EVIDENCE_MAX),
+            evidence_text=clip(f"CFBundleURLSchemes: {scheme}", _EVIDENCE_MAX),
         ))
 
 

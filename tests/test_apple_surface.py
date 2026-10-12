@@ -97,7 +97,7 @@ def test_ats_exceptions_and_url_scheme_with_file_and_line(tmp_path: Path) -> Non
     assert ats[2].evidence_text == "NSExceptionDomains.old-tls.example.com: NSExceptionMinimumTLSVersion = TLSv1.0"
     scheme = _issues(result, "apple_custom_url_scheme")
     assert [(i.file, i.line, i.severity) for i in scheme] == [("App/Info.plist", 12, "low")]
-    assert scheme[0].evidence_text == "CFBundleURLSchemes: exampleapp://; handled at App/SceneDelegate.swift:3"
+    assert scheme[0].evidence_text == "CFBundleURLSchemes: exampleapp://"
     hints = {(h.hint, h.file, h.line) for h in result.entrypoint_hints}
     assert ("url_scheme: exampleapp://", "App/Info.plist", 12) in hints
     assert ("url_scheme_handler (opens URLs from other apps)", "App/SceneDelegate.swift", 3) in hints
@@ -114,6 +114,14 @@ def test_binary_plist_and_scoped_ats_keys(tmp_path: Path) -> None:
     assert [(i.line, i.severity) for i in ats] == [(None, "low"), (None, "low")]
     assert "ignored on iOS 10+" in (ats[0].evidence_text or "")
     assert [i.evidence_text for i in _issues(result, "apple_custom_url_scheme")] == ["CFBundleURLSchemes: fb12345://"]
+
+
+def test_two_schemes_in_one_binary_plist_stay_two(tmp_path: Path) -> None:
+    data = plistlib.dumps({"CFBundleURLTypes": [{"CFBundleURLSchemes": ["one", "two"]}]}, fmt=plistlib.FMT_BINARY)
+    result = _analyze(tmp_path, {"Ext/Info.plist": data})
+    assert [(i.line, i.evidence_text) for i in _issues(result, "apple_custom_url_scheme")] == [
+        (None, "CFBundleURLSchemes: one://"), (None, "CFBundleURLSchemes: two://"),
+    ]
 
 
 def test_secure_plist_has_no_issues(tmp_path: Path) -> None:

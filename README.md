@@ -63,8 +63,8 @@ of the repo are not followed.
     iOS 10+ ignore it), `...InWebContent` / `...ForMedia`, and per-domain
     `NSExceptionAllowsInsecureHTTPLoads` or a TLS minimum below 1.2 (low). Each custom
     `CFBundleURLSchemes` scheme is an entry point and an `apple-custom-url-scheme` finding
-    (low) that cites the handler (`application(_:open:options:)`,
-    `scene(_:openURLContexts:)`, `.onOpenURL`).
+    (low); the handlers (`application(_:open:options:)`,
+    `scene(_:openURLContexts:)`, `.onOpenURL`) are reported as entry points.
   - `*.entitlements`: `cs.disable-library-validation`, `allow-dyld-environment-variables`,
     `allow-unsigned-executable-memory`, `disable-executable-page-protection` (medium);
     `get-task-allow` outside a Debug/Dev entitlements file (low); `applinks:` universal-link
