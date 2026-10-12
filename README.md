@@ -101,9 +101,23 @@ of the repo are not followed.
   Perfect) when declared in the manifest.
 - **Entrypoints** — `main.swift` and `@main`.
 
+- **Objective-C / Objective-C++** ([AttackMap#190](https://github.com/mlaify/AttackMap/issues/190)) —
+  a second analyzer in this package, `objc` (opt-in: `-m objc`), for `.m`/`.mm` files that
+  look like Objective-C (not MATLAB). It runs the same project-file checks (Info.plist,
+  entitlements, xcconfig, Cartfile.resolved) and, in code: URL-scheme / universal-link / XPC
+  entry points, `evaluateJavaScript:` with a `stringWithFormat:` `%@` inside a JS string
+  literal, secret-named values or keys in `NSUserDefaults` or on the pasteboard, XPC
+  listeners that return `YES` without checking the peer, `NSClassFromString` /
+  `NSSelectorFromString` / `dlopen` on built strings, and the native weaknesses shared with
+  the C/C++ plugins: a non-literal, non-localized format with no arguments
+  (`[NSString stringWithFormat:msg]`, `NSLog(msg)`) as `format_string`, and `/bin/sh -c`
+  with a built command or `system()`/`popen()` on a non-literal as `native_command_exec`.
+  `NSFileManager`/`NSURL` file sinks aren't reported (no Objective-C taint pass yet).
+  When both analyzers run, core's merge drops the duplicate project-file signals.
+
 ## Roadmap
 
-- **Objective-C / Objective-C++** ([AttackMap#190](https://github.com/mlaify/AttackMap/issues/190)) — a second analyzer (`objc`) in this package that shares the app-surface model.
+- Taint for Swift/Objective-C sources (URL-scheme parameters to WKWebView / file sinks).
 
 Part of the [Swift analyzer epic](https://github.com/mlaify/AttackMap/issues/204).
 
