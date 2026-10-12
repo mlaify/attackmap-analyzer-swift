@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "attackmap-analyzer-swift"
 version = "0.1.0"
-description = "Swift ecosystem analyzer plugin for AttackMap (SwiftPM projects, Package.resolved SBOM; server-side Vapor/Hummingbird and iOS/macOS app surface land in later slices)."
+description = "Swift ecosystem analyzer plugin for AttackMap (Vapor/Hummingbird routes with route-level auth, SwiftPM and CocoaPods SBOM; the iOS/macOS app surface lands in a later slice)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}

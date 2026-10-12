@@ -171,3 +171,61 @@ def test_symlinked_files_outside_repo_not_analyzed(tmp_path: Path):
     assert result.dependencies == []
     assert result.entrypoint_hints == []
     assert [h.hint for h in result.framework_hints if h.hint == "SwiftPM"] == ["SwiftPM"]
+
+
+# ---------- Podfile.lock (CocoaPods SBOM, swift#1) ----------
+
+PODFILE_LOCK = """PODS:
+  - AFNetworking (4.0.1):
+    - AFNetworking/NSURLSession (= 4.0.1)
+  - AFNetworking/NSURLSession (4.0.1)
+  - "GoogleUtilities/Environment (7.11.0)":
+    - PromisesObjC (< 3.0, >= 1.2)
+  - PromisesObjC (2.3.1)
+  - LocalPod (0.1.0)
+
+DEPENDENCIES:
+  - AFNetworking (~> 4.0)
+  - GoogleUtilities/Environment
+  - LocalPod (from `../LocalPod`)
+
+SPEC REPOS:
+  trunk:
+    - AFNetworking
+    - GoogleUtilities
+    - PromisesObjC
+
+EXTERNAL SOURCES:
+  LocalPod:
+    :path: "../LocalPod"
+
+SPEC CHECKSUMS:
+  AFNetworking: 3bd23d814e976cd148d7d44c3ab78017b744cd58
+
+COCOAPODS: 1.15.2
+"""
+
+
+def test_podfile_lock_sbom(tmp_path: Path):
+    _write(tmp_path, "ios/Podfile.lock", PODFILE_LOCK)
+    result = SwiftAnalyzer().analyze(tmp_path)
+    deps = {d.name: d for d in result.dependencies}
+    assert set(deps) == {"AFNetworking", "GoogleUtilities", "PromisesObjC", "LocalPod"}
+    afn = deps["AFNetworking"]
+    assert (afn.version, afn.ecosystem, afn.file, afn.line) == ("4.0.1", "cocoapods", "ios/Podfile.lock", 2)
+    assert afn.resolved is True and afn.direct is True
+    assert deps["GoogleUtilities"].version == "7.11.0" and deps["GoogleUtilities"].direct is True
+    assert deps["PromisesObjC"].direct is False          # only pulled in transitively
+    assert deps["LocalPod"].direct is True
+
+
+def test_podfile_lock_garbage_does_not_crash(tmp_path: Path):
+    import random
+
+    rng = random.Random(1)
+    _write(tmp_path, "Podfile.lock", "PODS:\n  - (\n  - X (\nDEPENDENCIES:\n  -\n" + "".join(
+        rng.choice('PODS:-() "\n\t:/') for _ in range(2000)))
+    SwiftAnalyzer().analyze(tmp_path)  # must not raise
+    for cut in range(0, len(PODFILE_LOCK), 5):
+        _write(tmp_path, "Podfile.lock", PODFILE_LOCK[:cut])
+        SwiftAnalyzer().analyze(tmp_path)
