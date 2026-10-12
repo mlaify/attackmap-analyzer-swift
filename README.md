@@ -13,9 +13,9 @@ Auto-discovered via the `attackmap.analyzers` entry point once installed.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> **Status: early scaffold (v0.1.0).** SwiftPM project detection + a
-> `Package.resolved` dependency SBOM. Server-side route extraction and the
-> iOS/macOS app attack surface are on the roadmap (below).
+> **Status: experimental.** Vapor / Hummingbird routes with route-level auth, and a
+> SwiftPM + CocoaPods dependency SBOM. The iOS/macOS app attack surface is on the
+> roadmap (below).
 
 ## Install
 
@@ -39,18 +39,36 @@ of the repo are not followed.
 
 - **SwiftPM detection** — recognizes `Package.swift`, `.xcodeproj` / `.xcworkspace`,
   and `.swift` sources; emits a `SwiftPM` framework hint.
+- **Server-side routes** ([AttackMap#187](https://github.com/mlaify/AttackMap/issues/187)) —
+  Vapor 4 and Hummingbird 1.x/2.x route registrations (`app.get("users", ":id")`,
+  `on(.POST, ...)`, `webSocket`/`ws`, `router.get("/x")`, chained
+  `group.get(use:).post(use:)`), with prefixes from `grouped(...)` / `group(...)`
+  (closures, bindings and chains), and from where a `RouteCollection` or controller
+  is mounted (`register(collection:)`, `addRoutes(to:)`, `addRoutes(_:atPath:)`) when
+  every mount in the same Swift package agrees. Each route carries `auth`, `guards`
+  and `guard_evidence` (AttackMap#256): `required` when Vapor's
+  `X.guardMiddleware()` / `X.redirectMiddleware(...)`, Hummingbird's
+  `IsAuthenticatedMiddleware` or an `*Authorization*Middleware` applies, or the
+  handler calls `req.auth.require(...)` / `context.requireIdentity()` or guards on
+  the caller's identity with a 401. An authenticator alone (`UserAuthenticator()`,
+  `SessionAuthenticator`) leaves the route `unknown`, since it only identifies callers
+  who send credentials. Role checks in the handler (`guard user.roles.contains(.admin)`)
+  are reported as guards. Paths the code computes (`SiteURL.faq.pathComponents`) are
+  kept as `$(SiteURL.faq)`, and an unknown mount as `$(TypeName)`. Test targets
+  (`Tests/`, `*Tests/`) are skipped.
 - **Dependency SBOM** — parses `Package.resolved` (formats **v1**, **v2**, and **v3**,
   including the copy Xcode stashes under `*.xcworkspace/xcshareddata/swiftpm/`) into
   the scan's dependency inventory, marking direct vs. transitive by cross-referencing
-  the `Package.swift` manifest. Swift packages are inventoried but not CVE-matched —
-  OSV.dev has no SwiftPM ecosystem yet.
+  the `Package.swift` manifest. SwiftPM pins carry their repository URL, which
+  `--cve` matches against OSV's `SwiftURL` ecosystem. CocoaPods `Podfile.lock` pods
+  are inventoried (`cocoapods`; direct when listed under `DEPENDENCIES:`, subspecs
+  folded into their pod); OSV has no CocoaPods database, so they aren't CVE-matched.
 - **Framework hints** — flags server-side frameworks (Vapor, Hummingbird, Kitura,
   Perfect) when declared in the manifest.
 - **Entrypoints** — `main.swift` and `@main`.
 
 ## Roadmap
 
-- **Server-side routes** ([AttackMap#187](https://github.com/mlaify/AttackMap/issues/187)) — Vapor / Hummingbird route + auth-middleware extraction.
 - **iOS/macOS app attack surface** ([AttackMap#188](https://github.com/mlaify/AttackMap/issues/188)) — URL schemes, universal links, `WKWebView` JS eval, Keychain / `UserDefaults` secrets, App Transport Security exceptions, pasteboard, XPC.
 
 Part of the [Swift analyzer epic](https://github.com/mlaify/AttackMap/issues/204).

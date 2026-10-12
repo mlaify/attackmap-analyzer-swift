@@ -1,14 +1,18 @@
 """Swift ecosystem analyzer for AttackMap.
 
-Slice #186 (scaffold): SwiftPM project detection and a dependency SBOM parsed
-from ``Package.resolved`` (formats v1/v2/v3), plus light framework and entrypoint
-recon. Server-side route extraction (Vapor/Hummingbird, #187) and the iOS/macOS
-app attack surface (#188) land in later slices.
+- SwiftPM project detection and a dependency SBOM from ``Package.resolved``
+  (formats v1/v2/v3) and CocoaPods' ``Podfile.lock``.
+- Server-side routes (#187): Vapor 4 and Hummingbird 1.x/2.x, with prefixes,
+  mounts and route-level auth (``routes.py``).
+- Framework hints and ``main.swift`` / ``@main`` entrypoints.
+
+The iOS/macOS app attack surface (#188) lands in a later slice.
 """
 
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 from pathlib import Path
 
@@ -19,8 +23,11 @@ from .contracts import (
     DependencyHint,
     EntrypointHint,
     FrameworkHint,
+    Route,
     ScanResult,
 )
+from .routes import extract_repo_routes
+from .sbom import parse_podfile_lock
 
 # Swift-specific additions to the shared skip list (which already covers
 # build/, .git/, node_modules/, __pycache__/, ...). Matched against directory
@@ -32,7 +39,7 @@ SKIP_DIRS = DEFAULT_SKIP_DIRS | {
     "Carthage",
 }
 
-_MANIFEST_NAMES = {"Package.swift", "Package.resolved"}
+_MANIFEST_NAMES = {"Package.swift", "Package.resolved", "Podfile.lock"}
 _XCODE_BUNDLE_SUFFIXES = {".xcodeproj", ".xcworkspace"}
 
 # Known server-side frameworks worth surfacing when seen in Package.swift deps.
@@ -64,6 +71,17 @@ def _line_of(content: str, needle: str) -> int | None:
     return line_of(content, idx)
 
 
+_TEST_DIRS = {"tests", "test", "uitests", "spec", "specs", "fixtures", "__tests__"}
+
+
+def _is_test_path(rel_path: str) -> bool:
+    """SwiftPM/Xcode test code: `Tests/`, `<Target>Tests/`, `FooTests.swift`."""
+    parts = rel_path.split("/")
+    if any(p.lower() in _TEST_DIRS or p.endswith("Tests") for p in parts[:-1]):
+        return True
+    return parts[-1].endswith(("Tests.swift", "Test.swift"))
+
+
 def _in_xcode_bundle(path: Path, root: Path) -> bool:
     """True if ``path`` sits inside a ``*.xcodeproj`` / ``*.xcworkspace`` bundle."""
     return any(Path(part).suffix in _XCODE_BUNDLE_SUFFIXES for part in Path(rel(path, root)).parts[:-1])
@@ -74,12 +92,12 @@ class SwiftAnalyzer:
         name="swift",
         display_name="Swift Analyzer",
         version="0.1.0",
-        description="Swift ecosystem analyzer: SwiftPM project detection and Package.resolved dependency SBOM. Server-side routes and app attack surface land in later slices.",
-        scope="Swift source trees and SwiftPM/Xcode projects. Detects the SwiftPM toolchain, server-side web frameworks in the manifest, and resolved package dependencies for CVE/SBOM.",
+        description="Swift ecosystem analyzer: Vapor/Hummingbird routes with route-level auth, and a SwiftPM/CocoaPods dependency SBOM. The iOS/macOS app surface lands in a later slice.",
+        scope="Swift source trees and SwiftPM/Xcode projects: server-side Swift routes (Vapor, Hummingbird), the SwiftPM toolchain and frameworks in the manifest, and resolved Package.resolved / Podfile.lock dependencies for CVE/SBOM.",
         targets=["swift", "swiftpm", "vapor", "hummingbird"],
         languages=["swift"],
         priority=20,
-        experimental=True,  # Early scaffold — coverage is intentionally partial.
+        experimental=True,  # Heuristic route extraction; app surface still to come.
         enabled_by_default=False,  # opt-in via `-m swift` while experimental (AttackMap#221)
     )
 
@@ -112,19 +130,57 @@ class SwiftAnalyzer:
         # resolved pins are marked direct against the manifests' dependencies.
         manifests: list[Path] = []
         resolved: list[Path] = []
+        pod_locks: list[Path] = []
         sources: list[Path] = []
         for path in iter_repo_files(root, suffixes={".swift"}, names=_MANIFEST_NAMES, skip_dirs=SKIP_DIRS):
             if path.name == "Package.swift":
                 manifests.append(path)
             elif path.name == "Package.resolved":
                 resolved.append(path)
+            elif path.name == "Podfile.lock":
+                pod_locks.append(path)
             if path.suffix == ".swift":
                 sources.append(path)
 
         direct = self._analyze_manifest(root, manifests, result)
         self._analyze_resolved(root, resolved, result, direct)
+        self._analyze_podfile_locks(root, pod_locks, result)
         self._analyze_entrypoints(root, sources, result)
+        self._analyze_routes(root, sources, manifests, result)
         return result
+
+    # ---------- Routes (#187) ----------
+
+    def _analyze_routes(self, root: Path, sources: list[Path], manifests: list[Path], result: ScanResult) -> None:
+        files: list[tuple[str, str]] = []
+        for path in sources:
+            rel_path = rel(path, root)
+            if _is_test_path(rel_path):
+                continue  # test apps register throwaway routes
+            text = read_source(path)
+            if text is not None:
+                files.append((rel_path, text))
+        package_dirs = [posixpath.dirname(rel(m, root)) for m in manifests]
+        for rel_path, hits in sorted(extract_repo_routes(files, package_dirs).items()):
+            for hit in hits:
+                result.routes.append(Route(
+                    path=hit.path, method=hit.method, file=rel_path, line=hit.line,
+                    auth=hit.auth, guards=hit.guards, guard_evidence=hit.evidence,
+                ))
+
+    # ---------- Podfile.lock (CocoaPods SBOM) ----------
+
+    def _analyze_podfile_locks(self, root: Path, locks: list[Path], result: ScanResult) -> None:
+        for lock in locks:
+            text = read_source(lock)
+            if text is None:
+                continue
+            rel_path = rel(lock, root)
+            for pod in parse_podfile_lock(text):
+                result.dependencies.append(DependencyHint(
+                    name=pod.name, version=pod.version, ecosystem="cocoapods", file=rel_path,
+                    line=pod.line, resolved=True, direct=pod.direct, source_analyzer="swift",
+                ))
 
     # ---------- Package.swift (manifest) ----------
 
