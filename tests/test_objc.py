@@ -222,3 +222,23 @@ int main(void) {
     checked = template.replace("    [newConnection resume];", "    if (![self isTrustedPeer:newConnection]) return NO;\n    [newConnection resume];")
     result = _analyze(tmp_path / "checked", {"MyService/main.m": checked})
     assert _lines(result, "apple_xpc_unvalidated_peer") == []
+
+
+def test_objc_review_fixes(tmp_path: Path) -> None:
+    source = r'''#import <WebKit/WebKit.h>
+@implementation Web
+- (void)find:(NSString *)raw theme:(NSString *)theme {
+    NSString *term = [raw wmf_stringByEscapingForJavaScript];
+    [self.webView evaluateJavaScript:[NSString stringWithFormat:@"find('%@')", term] completionHandler:nil];
+    [self.webView evaluateJavaScript:[NSString stringWithFormat:@"setTheme('%@', '%@')", @"dark", @42] completionHandler:nil];
+    [self.webView evaluateJavaScript:[NSString stringWithFormat:@"find('%@')", raw] completionHandler:nil];
+    [NSString performSelector:@selector(stringWithFormat:) withObject:raw];
+    BOOL hasShell = system(NULL);
+    system(cmd);
+}
+@end
+'''
+    result = _analyze(tmp_path, {"App/Web.m": source})
+    assert _lines(result, "apple_webview_js_injection") == [(7, "low")]  # only `raw`
+    assert _lines(result, "format_string") == []
+    assert _lines(result, "native_command_exec") == [(10, "medium")]

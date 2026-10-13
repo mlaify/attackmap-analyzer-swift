@@ -187,6 +187,41 @@ def _is_literal(expr: str) -> bool:
     return expr.strip().startswith(('@"', '"'))
 
 
+_SELECTOR_TAIL = re.compile(r"@selector[ \t]*\([ \t]*$")
+_NULL_ARGS = frozenset({"NULL", "nil", "0", "nullptr", "(char *)NULL", "(const char *)NULL"})
+_NUMBER = re.compile(r"@?\(?-?\d+(?:\.\d+)?\)?[a-zA-Z]{0,3}")
+
+
+def _is_constant(expr: str) -> bool:
+    """`@"dark"`, `"x"`, `@42`, `3`: nothing a caller controls."""
+    expr = expr.strip()
+    return _is_literal(expr) or _NUMBER.fullmatch(expr) is not None or expr in ("YES", "NO", "nil", "NULL")
+
+
+def _objc_bound_sanitized(expr: str, before: str) -> bool:
+    """True when the local ``expr`` was last assigned an encoded value:
+    `NSString *term = [raw wmf_stringByEscapingForJavaScript];`."""
+    name = expr.strip()
+    if not name.isidentifier():
+        return False
+    at = len(before)
+    for _ in range(64):
+        at = before.rfind(name, 0, at)
+        if at < 0:
+            return False
+        end = at + len(name)
+        prev = before[at - 1] if at > 0 else " "
+        if prev.isalnum() or prev == "_" or (end < len(before) and (before[end].isalnum() or before[end] == "_")):
+            continue
+        k = end
+        while k < len(before) and before[k] in " \t":
+            k += 1
+        if k < len(before) and before[k] == "=" and before[k + 1:k + 2] != "=":
+            line_end = before.find("\n", k)
+            return bool(apple_surface._SANITIZED.search(before[k:line_end if line_end >= 0 else len(before)]))
+    return False
+
+
 def _split_message_args(body: str) -> list[str]:
     """Top-level comma-separated parts of ``body`` (outside brackets/strings)."""
     parts: list[str] = []
@@ -356,7 +391,11 @@ def analyze_objc_source(rel_path: str, text: str, result: ScanResult, handlers: 
             continue
         rest = text[after:bracket[1]]
         args = [a.strip() for a in _split_message_args(rest)[1:]] if rest.lstrip().startswith(",") else []
-        exprs = js_injection_exprs(_quoted_format_args(fmt, args), text[max(0, m.start() - 4000):m.start()])
+        before = text[max(0, m.start() - 4000):m.start()]
+        exprs = [
+            e for e in js_injection_exprs(_quoted_format_args(fmt, args), before)
+            if not _is_constant(e) and not _objc_bound_sanitized(e, before)
+        ]
         if exprs:
             issue("apple_webview_js_injection", m.start(), js_injection_severity(exprs),
                   clip(f"{snippet(m.start())} [interpolated: {', '.join(exprs[:3])}]", _EVIDENCE_MAX))
@@ -404,6 +443,8 @@ def analyze_objc_source(rel_path: str, text: str, result: ScanResult, handlers: 
         rest = text[m.end():bracket[1]]
         parts = _split_message_args(rest)
         fmt = parts[0].strip()
+        if _SELECTOR_TAIL.search(text, max(0, m.start() - 40), m.start()):
+            continue  # `@selector(stringWithFormat:)` names the method, it doesn't call it
         if (
             len(parts) == 1 and fmt and not _is_literal(fmt) and not _LOCALIZED.search(fmt)
             and not _FORWARDED_FORMAT.search(rest)
@@ -432,8 +473,8 @@ def analyze_objc_source(rel_path: str, text: str, result: ScanResult, handlers: 
         if not code(m.start()):
             continue
         arg = _first_arg(text, m.end() - 1, src)
-        if arg is not None and arg.strip() and not _is_literal(arg):
-            weakness("native_command_exec", m.start())
+        if arg is not None and arg.strip() and not _is_literal(arg) and arg.strip() not in _NULL_ARGS:
+            weakness("native_command_exec", m.start())  # `system(NULL)` only asks for a shell
 
 
 def looks_like_objc(text: str) -> bool:
