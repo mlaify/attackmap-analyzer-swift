@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - hardened-runtime exceptions, `get-task-allow` and universal links from `*.entitlements`;
   - secret-named literals in `*.xcconfig` (as hard-coded secrets);
   - in Swift: URL-scheme / universal-link / XPC entry points, WKWebView script built by interpolating into a JS string literal, secrets in UserDefaults / `@AppStorage` or on the pasteboard, XPC listeners that accept every peer, and dynamic dispatch on built strings.
+- `objc`: an Objective-C / Objective-C++ analyzer as a second entry point in this package (mlaify/AttackMap#190), sharing the app-surface model; format strings and shell commands are reported as the native `CodeWeakness` kinds shared with the C/C++ plugins (requires mlaify/AttackMap#333 and #347).
 - Carthage SBOM: `Cartfile.resolved` pins as `carthage` dependencies, CVE-matched by repository URL.
 - CocoaPods SBOM: `Podfile.lock` pods are inventoried as `cocoapods` dependencies, direct when the Podfile lists them (#1).
 

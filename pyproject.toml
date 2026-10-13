@@ -64,6 +64,7 @@ Changelog = "https://github.com/mlaify/attackmap-analyzer-swift/blob/main/CHANGE
 
 [project.entry-points."attackmap.analyzers"]
 swift = "attackmap_analyzer_swift:SwiftAnalyzer"
+objc = "attackmap_analyzer_swift:ObjCAnalyzer"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
