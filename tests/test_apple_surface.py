@@ -367,7 +367,7 @@ def test_finalize_xpc_is_linear() -> None:
     import time
 
     from attackmap_analyzer_swift.apple_surface import XPC_MACH_HINT, finalize_xpc
-    from attackmap_analyzer_swift.contracts import AppSurfaceIssue, EntrypointHint, ScanResult
+    from attackmap.sdk import AppSurfaceIssue, EntrypointHint, ScanResult
 
     result = ScanResult(root=".")
     for i in range(8000):

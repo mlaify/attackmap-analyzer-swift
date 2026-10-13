@@ -20,16 +20,20 @@ import posixpath
 import re
 from pathlib import Path
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
-
-from .contracts import (
+from attackmap.sdk import (
+    DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     DependencyHint,
     EntrypointHint,
     FrameworkHint,
+    iter_repo_files,
+    line_of,
+    read_source,
+    rel,
     Route,
     ScanResult,
 )
+
 from . import apple_surface
 from .routes import extract_repo_routes
 from .sbom import parse_podfile_lock

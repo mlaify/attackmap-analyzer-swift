@@ -38,7 +38,13 @@ from attackmap.sdk import iter_repo_files, line_of, read_source, rel
 from . import apple_surface
 from .analyzer import SKIP_DIRS, _is_test_path
 from .apple_surface import Handler, is_secret_name, js_injection_exprs, js_injection_severity
-from .contracts import AnalyzerMetadata, AppSurfaceIssue, CodeWeakness, EntrypointHint, ScanResult
+from attackmap.sdk import (
+    AnalyzerMetadata,
+    AppSurfaceIssue,
+    CodeWeakness,
+    EntrypointHint,
+    ScanResult,
+)
 from .swiftsrc import Source, clip
 
 OBJC_SUFFIXES = {".m", ".mm"}
