@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **License metadata uses an SPDX expression (PEP 639).** `license = "MIT"` and `license-files = ["LICENSE"]` replace the deprecated `license = {text = "MIT"}` table, and the `License ::` classifier (which setuptools ≥ 77 rejects next to an expression) is gone. The build backend floor is now `setuptools>=77` (mlaify/AttackMap#259).
+- **Added `AGENTS.md`**, matching the other analyzer repos (mlaify/AttackMap#259).
 - Walk and read the repo with the shared `attackmap.sdk` helpers (`iter_repo_files`, `read_source`, `rel`, `line_of`) instead of local `rglob` + `SKIP_DIRS` walks; `analyze()` now walks the repo once instead of three times (mlaify/AttackMap#253).
 - The analyzer is now opt-in while experimental (`enabled_by_default=False`): run it with `attackmap analyze <repo> -m swift` (mlaify/AttackMap#221).
 - The README no longer says SwiftPM pins aren't CVE-matched: core maps them to OSV's `SwiftURL` ecosystem by repository URL (mlaify/AttackMap#255).
