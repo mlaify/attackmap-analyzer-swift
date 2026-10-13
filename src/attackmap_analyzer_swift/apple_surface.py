@@ -30,9 +30,18 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from attackmap.sdk import iter_repo_files, line_of, read_source, rel
+from attackmap.sdk import (
+    AppSurfaceIssue,
+    DependencyHint,
+    EntrypointHint,
+    iter_repo_files,
+    line_of,
+    read_source,
+    rel,
+    ScanResult,
+    SecretHint,
+)
 
-from .contracts import AppSurfaceIssue, DependencyHint, EntrypointHint, ScanResult, SecretHint
 from .swiftsrc import clip
 
 _PLIST_MAX_BYTES = 1_000_000
