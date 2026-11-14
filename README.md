@@ -20,8 +20,8 @@ Auto-discovered via the `attackmap.analyzers` entry point once installed.
 ## Install
 
 ```bash
-uv tool install attackmap --with attackmap-analyzer-swift \
-  --index mlaify=https://pkg.mlaify.io/pypi/simple/ --index-strategy first-index
+uv tool install attackmap --with attackmap-analyzer-swift    # from PyPI
+# or: pip install attackmap-analyzer-swift    (installs attackmap too)
 # or from source:
 pip install git+https://github.com/mlaify/attackmap-analyzer-swift.git    # alongside attackmap
 ```
