@@ -101,7 +101,7 @@ class SwiftAnalyzer:
     metadata = AnalyzerMetadata(
         name="swift",
         display_name="Swift Analyzer",
-        version=plugin_version("attackmap-analyzer-swift", default="0.2.1"),
+        version=plugin_version("attackmap-analyzer-swift", default="0.3.0"),
         requires_core=">=0.8,<2",
         description="Swift ecosystem analyzer: Vapor/Hummingbird routes with route-level auth, the iOS/macOS app attack surface (ATS, URL schemes, entitlements, WKWebView, UserDefaults, XPC), and a SwiftPM/CocoaPods/Carthage dependency SBOM.",
         scope="Swift source trees and SwiftPM/Xcode projects: server-side Swift routes (Vapor, Hummingbird), iOS/macOS app projects (Info.plist, entitlements, xcconfig), and resolved Package.resolved / Podfile.lock / Cartfile.resolved dependencies for CVE/SBOM.",
