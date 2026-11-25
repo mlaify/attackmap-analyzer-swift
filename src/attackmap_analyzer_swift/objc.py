@@ -39,6 +39,7 @@ from . import apple_surface
 from .analyzer import SKIP_DIRS, _is_test_path
 from .apple_surface import Handler, is_secret_name, js_injection_exprs, js_injection_severity
 from attackmap.sdk import (
+    plugin_version,
     AnalyzerMetadata,
     AppSurfaceIssue,
     CodeWeakness,
@@ -491,7 +492,8 @@ class ObjCAnalyzer:
     metadata = AnalyzerMetadata(
         name="objc",
         display_name="Objective-C Analyzer",
-        version="0.2.1",
+        version=plugin_version("attackmap-analyzer-swift", default="0.2.1"),
+        requires_core=">=0.8,<2",
         description="Objective-C / Objective-C++ analyzer: the iOS/macOS app attack surface (ATS, URL schemes, entitlements, WKWebView, NSUserDefaults, XPC), format strings, shell commands and dynamic dispatch.",
         scope="Objective-C and Objective-C++ (.m/.mm) iOS/macOS apps and frameworks, with their Info.plist, entitlements, xcconfig and Carthage files.",
         targets=["ios", "macos", "cocoa"],
